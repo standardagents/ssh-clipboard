@@ -223,6 +223,8 @@ impl NativeClipboard {
             contents.push(ClipboardContent::Files(native_files));
         } else {
             let mut added_files = false;
+            #[cfg(target_os = "macos")]
+            let mut native_formats = MacosFormats::default();
             for representation in representations {
                 if representation.format.trim().is_empty()
                     || is_internal_marker(&representation.format)
@@ -230,15 +232,25 @@ impl NativeClipboard {
                 {
                     continue;
                 }
-                if is_file_format(&representation.format) && !added_files && !native_files.is_empty() {
-                    contents.push(ClipboardContent::Files(native_files.clone()));
-                    added_files = true;
+                if is_file_format(&representation.format) {
+                    if !added_files && !native_files.is_empty() {
+                        contents.push(ClipboardContent::Files(native_files.clone()));
+                        added_files = true;
+                        continue;
+                    }
+                    #[cfg(target_os = "macos")]
                     continue;
                 }
-                contents.push(ClipboardContent::Other(
-                    representation.format.clone(),
-                    representation.data.clone(),
-                ));
+                #[cfg(target_os = "macos")]
+                let format = {
+                    let Some(format) = native_formats.normalize(&representation.format) else {
+                        continue;
+                    };
+                    format
+                };
+                #[cfg(not(target_os = "macos"))]
+                let format = representation.format.clone();
+                contents.push(ClipboardContent::Other(format, representation.data.clone()));
             }
         }
         if contents.is_empty() {
@@ -367,6 +379,66 @@ fn is_image_format(format: &str) -> bool {
             | "org.webmproject.webp"
             | "image/webp"
     )
+}
+
+#[cfg(any(target_os = "macos", test))]
+#[derive(Default)]
+struct MacosFormats {
+    added: HashSet<String>,
+}
+
+#[cfg(any(target_os = "macos", test))]
+impl MacosFormats {
+    fn normalize(&mut self, format: &str) -> Option<String> {
+        let format = macos_clipboard_format(format)?.to_owned();
+        self.added.insert(format.clone()).then_some(format)
+    }
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn macos_clipboard_format(format: &str) -> Option<&str> {
+    if format.eq_ignore_ascii_case("text/plain;charset=utf-8") {
+        return Some("public.utf8-plain-text");
+    }
+    let mapped = match format {
+        "UTF8_STRING" | "text/plain" | "public.plain-text" | "NSStringPboardType" => {
+            "public.utf8-plain-text"
+        }
+        "text/html" => "public.html",
+        "text/rtf" | "application/rtf" => "public.rtf",
+        "image/png" => "public.png",
+        "image/jpeg" | "image/jpg" => "public.jpeg",
+        "image/tiff" => "public.tiff",
+        "image/gif" => "com.compuserve.gif",
+        "image/heic" => "public.heic",
+        "image/heif" => "public.heif",
+        "image/webp" => "org.webmproject.webp",
+        "application/pdf" => "com.adobe.pdf",
+        _ if is_valid_macos_uti(format) => format,
+        _ => return None,
+    };
+    Some(mapped)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn is_valid_macos_uti(format: &str) -> bool {
+    let mut labels = format.split('.');
+    let Some(first) = labels.next() else {
+        return false;
+    };
+    let Some(second) = labels.next() else {
+        return false;
+    };
+    valid_uti_label(first) && valid_uti_label(second) && labels.all(valid_uti_label)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn valid_uti_label(label: &str) -> bool {
+    label.as_bytes().first().is_some_and(u8::is_ascii_alphanumeric)
+        && label.as_bytes().last().is_some_and(u8::is_ascii_alphanumeric)
+        && label
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 fn is_permission_denied(error: &anyhow::Error) -> bool {
@@ -540,5 +612,66 @@ mod tests {
             data: b"same".to_vec(),
         }]);
         assert_ne!(first.fingerprint, second.fingerprint);
+    }
+
+    #[test]
+    fn macos_normalizes_portable_formats_to_native_types() {
+        for (portable, native) in [
+            ("UTF8_STRING", "public.utf8-plain-text"),
+            ("text/plain;charset=utf-8", "public.utf8-plain-text"),
+            ("text/plain;charset=UTF-8", "public.utf8-plain-text"),
+            ("public.plain-text", "public.utf8-plain-text"),
+            ("NSStringPboardType", "public.utf8-plain-text"),
+            ("text/html", "public.html"),
+            ("text/rtf", "public.rtf"),
+            ("image/png", "public.png"),
+            ("image/jpeg", "public.jpeg"),
+            ("image/tiff", "public.tiff"),
+            ("image/gif", "com.compuserve.gif"),
+            ("image/heic", "public.heic"),
+            ("image/heif", "public.heif"),
+            ("image/webp", "org.webmproject.webp"),
+            ("application/pdf", "com.adobe.pdf"),
+        ] {
+            assert_eq!(macos_clipboard_format(portable), Some(native));
+        }
+        assert_eq!(
+            macos_clipboard_format("public.utf8-plain-text"),
+            Some("public.utf8-plain-text")
+        );
+        assert_eq!(
+            macos_clipboard_format("com.example.custom"),
+            Some("com.example.custom")
+        );
+        for unsupported in [
+            "STRING",
+            "TEXT",
+            "COMPOUND_TEXT",
+            "application/x-custom",
+            "x-special/gnome-copied-files",
+            "foo",
+            "com..example",
+            "com.example_thing",
+        ] {
+            assert_eq!(macos_clipboard_format(unsupported), None);
+        }
+    }
+
+    #[test]
+    fn macos_collapses_equivalent_formats_before_native_apply() {
+        let mut formats = MacosFormats::default();
+
+        assert_eq!(
+            formats.normalize("UTF8_STRING"),
+            Some("public.utf8-plain-text".to_owned())
+        );
+        assert_eq!(formats.normalize("text/plain"), None);
+        assert_eq!(formats.normalize("text/plain;charset=UTF-8"), None);
+        assert_eq!(formats.normalize("public.utf8-plain-text"), None);
+        assert_eq!(formats.normalize("STRING"), None);
+        assert_eq!(
+            formats.normalize("com.example.custom"),
+            Some("com.example.custom".to_owned())
+        );
     }
 }
