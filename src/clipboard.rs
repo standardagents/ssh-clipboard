@@ -223,6 +223,7 @@ impl NativeClipboard {
             contents.push(ClipboardContent::Files(native_files));
         } else {
             let mut added_files = false;
+            let mut added_formats = HashSet::new();
             for representation in representations {
                 if representation.format.trim().is_empty()
                     || is_internal_marker(&representation.format)
@@ -235,10 +236,17 @@ impl NativeClipboard {
                     added_files = true;
                     continue;
                 }
-                contents.push(ClipboardContent::Other(
-                    representation.format.clone(),
-                    representation.data.clone(),
-                ));
+
+                #[cfg(target_os = "macos")]
+                let Some(format) = macos::native_pasteboard_format(&representation.format) else {
+                    continue;
+                };
+                #[cfg(not(target_os = "macos"))]
+                let format = representation.format.clone();
+                if !added_formats.insert(format.clone()) {
+                    continue;
+                }
+                contents.push(ClipboardContent::Other(format, representation.data.clone()));
             }
         }
         if contents.is_empty() {

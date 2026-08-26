@@ -37,6 +37,7 @@ clipboard-rs = { version = "0.3.5", default-features = false, features = ["image
 objc2 = "0.6.3"
 objc2-app-kit = { version = "0.3.2", features = ["NSPasteboard", "NSPasteboardItem"] }
 objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSData", "NSString"] }
+objc2-uniform-type-identifiers = { version = "0.3.2", default-features = false, features = ["UTType"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 clipboard-rs = { version = "0.3.5", default-features = false, features = ["wayland"] }
