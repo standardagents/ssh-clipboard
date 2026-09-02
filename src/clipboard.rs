@@ -223,6 +223,8 @@ impl NativeClipboard {
             contents.push(ClipboardContent::Files(native_files));
         } else {
             let mut added_files = false;
+            #[cfg(target_os = "macos")]
+            let mut published = HashSet::new();
             for representation in representations {
                 if representation.format.trim().is_empty()
                     || is_internal_marker(&representation.format)
@@ -235,6 +237,22 @@ impl NativeClipboard {
                     added_files = true;
                     continue;
                 }
+                #[cfg(target_os = "macos")]
+                {
+                    // NSPasteboard refuses any type that is not a valid UTI, and one
+                    // refused type is enough to leave the whole item empty, so map the
+                    // portable MIME names a Linux peer sends back to pasteboard types
+                    // and drop anything that has no equivalent.
+                    let Some(native) = native_pasteboard_type(&representation.format) else {
+                        continue;
+                    };
+                    if !published.insert(native.clone()) {
+                        continue;
+                    }
+                    contents.push(ClipboardContent::Other(native, representation.data.clone()));
+                    continue;
+                }
+                #[cfg(not(target_os = "macos"))]
                 contents.push(ClipboardContent::Other(
                     representation.format.clone(),
                     representation.data.clone(),
@@ -388,6 +406,51 @@ fn clipboard_file_paths(representations: &[Representation]) -> Vec<String> {
         .collect()
 }
 
+/// Maps a portable MIME name onto the macOS pasteboard type carrying the same
+/// bytes. `add_portable_aliases` is the outbound half of this pairing; without
+/// the inbound half every representation from a Wayland or X11 peer reaches
+/// NSPasteboard as an invalid UTI and the publish clears the pasteboard.
+#[cfg(target_os = "macos")]
+fn native_pasteboard_type(format: &str) -> Option<String> {
+    if is_pasteboard_type(format) {
+        return Some(format.to_owned());
+    }
+    // MIME names carry parameters such as `text/plain;charset=utf-8`.
+    let base = format
+        .split(';')
+        .next()
+        .unwrap_or(format)
+        .trim()
+        .to_ascii_lowercase();
+    let native = match base.as_str() {
+        "text/plain" | "text" | "string" | "utf8_string" => "public.utf8-plain-text",
+        "text/html" => "public.html",
+        "text/rtf" | "application/rtf" => "public.rtf",
+        "image/png" => "public.png",
+        "image/jpeg" | "image/jpg" => "public.jpeg",
+        "image/tiff" => "public.tiff",
+        "image/gif" => "com.compuserve.gif",
+        "image/heic" => "public.heic",
+        "image/heif" => "public.heif",
+        "image/webp" => "org.webmproject.webp",
+        "application/pdf" => "com.adobe.pdf",
+        "text/uri-list" => "public.file-url",
+        _ => return None,
+    };
+    Some(native.to_owned())
+}
+
+/// Recognizes the reverse-DNS UTIs a macOS peer sends, which pass through
+/// unchanged.
+#[cfg(target_os = "macos")]
+fn is_pasteboard_type(format: &str) -> bool {
+    format.contains('.')
+        && !format.contains('/')
+        && format
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+' | '_'))
+}
+
 fn add_portable_aliases(representations: &mut Vec<Representation>, mut remaining: u64) {
     let originals = representations.clone();
     for representation in originals {
@@ -465,6 +528,36 @@ pub mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn maps_portable_mime_names_onto_pasteboard_types() {
+        assert_eq!(
+            native_pasteboard_type("text/plain;charset=utf-8").as_deref(),
+            Some("public.utf8-plain-text")
+        );
+        assert_eq!(
+            native_pasteboard_type("UTF8_STRING").as_deref(),
+            Some("public.utf8-plain-text")
+        );
+        assert_eq!(native_pasteboard_type("image/png").as_deref(), Some("public.png"));
+        assert_eq!(native_pasteboard_type("text/html").as_deref(), Some("public.html"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn passes_pasteboard_types_through_and_drops_unmappable_names() {
+        assert_eq!(
+            native_pasteboard_type("public.utf8-plain-text").as_deref(),
+            Some("public.utf8-plain-text")
+        );
+        assert_eq!(
+            native_pasteboard_type("org.webmproject.webp").as_deref(),
+            Some("org.webmproject.webp")
+        );
+        assert_eq!(native_pasteboard_type("application/x-custom"), None);
+        assert_eq!(native_pasteboard_type("NeXT TIFF v4.0 pasteboard type"), None);
+    }
 
     #[test]
     fn aliases_are_additive_and_preserve_original_bytes() {
