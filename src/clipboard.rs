@@ -223,6 +223,8 @@ impl NativeClipboard {
             contents.push(ClipboardContent::Files(native_files));
         } else {
             let mut added_files = false;
+            #[cfg(target_os = "macos")]
+            let mut published = HashSet::new();
             for representation in representations {
                 if representation.format.trim().is_empty()
                     || is_internal_marker(&representation.format)
@@ -235,6 +237,21 @@ impl NativeClipboard {
                     added_files = true;
                     continue;
                 }
+                #[cfg(target_os = "macos")]
+                {
+                    // NSPasteboard refuses any type that is not a valid UTI, and one
+                    // refused type is enough to leave the whole item empty, so map the
+                    // portable MIME names a Linux peer sends back to pasteboard types
+                    // and drop anything that has no equivalent.
+                    let Some(native) = macos::native_pasteboard_type(&representation.format) else {
+                        continue;
+                    };
+                    if !published.insert(native.clone()) {
+                        continue;
+                    }
+                    contents.push(ClipboardContent::Other(native, representation.data.clone()));
+                }
+                #[cfg(not(target_os = "macos"))]
                 contents.push(ClipboardContent::Other(
                     representation.format.clone(),
                     representation.data.clone(),

@@ -64,6 +64,49 @@ fn publish_single_file_to(
     Ok(())
 }
 
+/// Maps a portable MIME name onto the macOS pasteboard type carrying the same
+/// bytes. `add_portable_aliases` is the outbound half of this pairing; without
+/// the inbound half every representation from a Wayland or X11 peer reaches
+/// `NSPasteboard` as an invalid UTI and the publish clears the pasteboard.
+pub(super) fn native_pasteboard_type(format: &str) -> Option<String> {
+    if is_pasteboard_type(format) {
+        return Some(format.to_owned());
+    }
+    // MIME names carry parameters such as `text/plain;charset=utf-8`.
+    let base = format
+        .split(';')
+        .next()
+        .unwrap_or(format)
+        .trim()
+        .to_ascii_lowercase();
+    let native = match base.as_str() {
+        "text/plain" | "text" | "string" | "utf8_string" => "public.utf8-plain-text",
+        "text/html" => "public.html",
+        "text/rtf" | "application/rtf" => "public.rtf",
+        "image/png" => "public.png",
+        "image/jpeg" | "image/jpg" => "public.jpeg",
+        "image/tiff" => "public.tiff",
+        "image/gif" => "com.compuserve.gif",
+        "image/heic" => "public.heic",
+        "image/heif" => "public.heif",
+        "image/webp" => "org.webmproject.webp",
+        "application/pdf" => "com.adobe.pdf",
+        "text/uri-list" => "public.file-url",
+        _ => return None,
+    };
+    Some(native.to_owned())
+}
+
+/// Recognizes the reverse-DNS UTIs a macOS peer sends, which pass through
+/// unchanged.
+fn is_pasteboard_type(format: &str) -> bool {
+    format.contains('.')
+        && !format.contains('/')
+        && format
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+' | '_'))
+}
+
 fn set_data(item: &NSPasteboardItem, format: &str, bytes: &[u8]) -> Result<()> {
     let data = NSData::with_bytes(bytes);
     if !item.setData_forType(&data, &NSString::from_str(format)) {
@@ -129,6 +172,37 @@ fn detect_image_format(path: &Path, bytes: &[u8]) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn maps_portable_mime_names_onto_pasteboard_types() {
+        assert_eq!(
+            native_pasteboard_type("text/plain;charset=utf-8").as_deref(),
+            Some("public.utf8-plain-text")
+        );
+        assert_eq!(
+            native_pasteboard_type("UTF8_STRING").as_deref(),
+            Some("public.utf8-plain-text")
+        );
+        assert_eq!(native_pasteboard_type("image/png").as_deref(), Some("public.png"));
+        assert_eq!(
+            native_pasteboard_type("text/html").as_deref(),
+            Some("public.html")
+        );
+    }
+
+    #[test]
+    fn passes_pasteboard_types_through_and_drops_unmappable_names() {
+        assert_eq!(
+            native_pasteboard_type("public.utf8-plain-text").as_deref(),
+            Some("public.utf8-plain-text")
+        );
+        assert_eq!(
+            native_pasteboard_type("org.webmproject.webp").as_deref(),
+            Some("org.webmproject.webp")
+        );
+        assert_eq!(native_pasteboard_type("application/x-custom"), None);
+        assert_eq!(native_pasteboard_type("NeXT TIFF v4.0 pasteboard type"), None);
+    }
 
     #[test]
     fn publishes_a_file_url_and_image_on_the_same_pasteboard_item() {
