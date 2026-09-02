@@ -67,7 +67,7 @@ fn publish_single_file_to(
 /// Maps a portable MIME name onto the macOS pasteboard type carrying the same
 /// bytes. `add_portable_aliases` is the outbound half of this pairing; without
 /// the inbound half every representation from a Wayland or X11 peer reaches
-/// NSPasteboard as an invalid UTI and the publish clears the pasteboard.
+/// `NSPasteboard` as an invalid UTI and the publish clears the pasteboard.
 pub(super) fn native_pasteboard_type(format: &str) -> Option<String> {
     if is_pasteboard_type(format) {
         return Some(format.to_owned());

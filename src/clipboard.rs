@@ -250,7 +250,6 @@ impl NativeClipboard {
                         continue;
                     }
                     contents.push(ClipboardContent::Other(native, representation.data.clone()));
-                    continue;
                 }
                 #[cfg(not(target_os = "macos"))]
                 contents.push(ClipboardContent::Other(
