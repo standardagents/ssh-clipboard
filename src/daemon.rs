@@ -13,7 +13,9 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
-use tracing::{debug, info, warn};
+#[cfg(target_os = "macos")]
+use tracing::debug;
+use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::clipboard::ClipboardBackend;
