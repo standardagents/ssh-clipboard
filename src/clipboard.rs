@@ -217,42 +217,38 @@ impl NativeClipboard {
         let mut contents = Vec::with_capacity(representations.len());
         let native_files = clipboard_file_paths(representations);
         #[cfg(target_os = "macos")]
-        if native_files.len() == 1 && std::path::Path::new(&native_files[0]).is_file() {
+        if !native_files.is_empty() {
             let context = self
                 .context
                 .lock()
                 .map_err(|_| anyhow::anyhow!("clipboard lock poisoned"))?;
-            macos::publish_single_file(std::path::Path::new(&native_files[0]), representations)?;
+            let paths = native_files
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect::<Vec<_>>();
+            macos::publish_files(&paths)?;
             drop(context);
             return self
                 .capture_sync()?
                 .context("native clipboard was empty immediately after publishing");
         }
-        if cfg!(target_os = "macos") && !native_files.is_empty() {
-            // Finder requires the pasteboard selection to consist entirely of
-            // NSURL file objects. clipboard-rs writes Files separately, so
-            // appending generic formats creates another item and makes the
-            // otherwise valid file selection non-pasteable in Finder.
-            contents.push(ClipboardContent::Files(native_files));
-        } else {
-            let mut added_files = false;
-            for representation in representations {
-                if representation.format.trim().is_empty()
-                    || is_internal_marker(&representation.format)
-                    || is_sensitive_marker(&representation.format)
-                {
-                    continue;
-                }
-                if is_file_format(&representation.format) && !added_files && !native_files.is_empty() {
-                    contents.push(ClipboardContent::Files(native_files.clone()));
-                    added_files = true;
-                    continue;
-                }
-                contents.push(ClipboardContent::Other(
-                    representation.format.clone(),
-                    representation.data.clone(),
-                ));
+        let mut added_files = false;
+        for representation in representations {
+            if representation.format.trim().is_empty()
+                || is_internal_marker(&representation.format)
+                || is_sensitive_marker(&representation.format)
+            {
+                continue;
             }
+            if is_file_format(&representation.format) && !added_files && !native_files.is_empty() {
+                contents.push(ClipboardContent::Files(native_files.clone()));
+                added_files = true;
+                continue;
+            }
+            contents.push(ClipboardContent::Other(
+                representation.format.clone(),
+                representation.data.clone(),
+            ));
         }
         if contents.is_empty() {
             bail!("clipboard payload has no safe representations");

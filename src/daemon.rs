@@ -1,4 +1,6 @@
 mod client;
+#[cfg(target_os = "macos")]
+mod file_conflict;
 mod runtime;
 
 use std::collections::HashMap;
@@ -19,6 +21,9 @@ use crate::filebundle;
 use crate::model::{Clip, Direction, MonitorEvent};
 use crate::protocol::{Message, read_message, write_clip, write_message};
 use crate::update::{self, CURRENT_VERSION};
+
+#[cfg(target_os = "macos")]
+use file_conflict::{ClaimKind, FileClaim};
 
 pub use client::{bridge, connect_monitor, notify_updates, query_status};
 pub use runtime::run;
@@ -81,6 +86,8 @@ struct Daemon {
     peers: RwLock<HashMap<Uuid, PeerLink>>,
     seen: Mutex<HashMap<Uuid, Instant>>,
     suppressed: Mutex<HashMap<[u8; 32], usize>>,
+    #[cfg(target_os = "macos")]
+    file_claim: Mutex<Option<FileClaim>>,
     apply_lock: Mutex<()>,
     events: broadcast::Sender<MonitorEvent>,
     desired_version: watch::Sender<String>,
@@ -109,6 +116,8 @@ impl Daemon {
             peers: RwLock::new(HashMap::new()),
             seen: Mutex::new(HashMap::new()),
             suppressed: Mutex::new(HashMap::new()),
+            #[cfg(target_os = "macos")]
+            file_claim: Mutex::new(None),
             apply_lock: Mutex::new(()),
             events,
             desired_version,
@@ -147,7 +156,23 @@ impl Daemon {
                         continue;
                     }
                     drop(suppressed);
+                    #[cfg(target_os = "macos")]
+                    if let Some((kind, claimed)) = self.matching_file_claim(&snapshot.representations).await {
+                        if kind == ClaimKind::Received {
+                            match self.clipboard.apply(&claimed.representations).await {
+                                Ok(restored) => self.suppress_fingerprint(restored.fingerprint).await,
+                                Err(error) => warn!(%error, clip = %claimed.id, "failed to restore native file clipboard"),
+                            }
+                        }
+                        continue;
+                    }
                     let clip = Arc::new(Clip::new(self.config.node_id, snapshot.representations));
+                    #[cfg(target_os = "macos")]
+                    if file_conflict::has_file_bundle(&clip.representations) {
+                        self.remember_file_clip(Arc::clone(&clip), ClaimKind::Local).await;
+                    } else {
+                        self.file_claim.lock().await.take();
+                    }
                     self.mark_seen(clip.id).await;
                     self.emit(Direction::Local, None, &clip);
                     self.broadcast_clip(clip, None).await;
@@ -166,7 +191,7 @@ impl Daemon {
         reader: &mut R,
         writer: &mut W,
         label: &str,
-        mut shutdown: watch::Receiver<bool>,
+        shutdown: watch::Receiver<bool>,
         established: Option<&AtomicBool>,
     ) -> Result<()>
     where
@@ -220,59 +245,82 @@ impl Daemon {
             established.store(true, Ordering::Release);
         }
 
-        let result = loop {
-            tokio::select! {
-                incoming = read_message(reader, self.config.max_bytes) => {
-                    match incoming {
-                        Ok(Message::Clip(clip)) => self.receive_clip(Arc::new(clip), &node_name, connection_id).await,
-                        Ok(Message::Hello { .. }) => {
-                            break Err(anyhow::anyhow!("peer sent a second hello"));
-                        }
-                        Ok(Message::UpdateAvailable { version, .. }) => {
-                            if let Some(peer) = self.peers.write().await.get_mut(&connection_id) {
-                                peer.desired_version = Some(version.clone());
+        // Keep the read half active while a large clipboard payload is being
+        // written. Clipboard bridges can make both peers publish at the same
+        // instant; serializing reads and writes would then fill both SSH pipe
+        // buffers and deadlock the connection.
+        let mut read_shutdown = shutdown.clone();
+        let mut write_shutdown = shutdown;
+        let read_loop = async {
+            loop {
+                tokio::select! {
+                    incoming = read_message(reader, self.config.max_bytes) => {
+                        match incoming {
+                            Ok(Message::Clip(clip)) => self.receive_clip(Arc::new(clip), &node_name, connection_id).await,
+                            Ok(Message::Hello { .. }) => {
+                                break Err(anyhow::anyhow!("peer sent a second hello"));
                             }
-                            if update::newer_version(CURRENT_VERSION, &version) {
-                                let _ = self.update_hints.send(version);
+                            Ok(Message::UpdateAvailable { version, .. }) => {
+                                if let Some(peer) = self.peers.write().await.get_mut(&connection_id) {
+                                    peer.desired_version = Some(version.clone());
+                                }
+                                if update::newer_version(CURRENT_VERSION, &version) {
+                                    let _ = self.update_hints.send(version);
+                                }
                             }
+                            Err(error) => break Err(error.into()),
                         }
-                        Err(error) => break Err(error.into()),
                     }
-                }
-                changed = receiver.changed() => {
-                    if changed.is_err() {
-                        break Ok(());
-                    }
-                    let clip = receiver.borrow_and_update().clone();
-                    if let Some(clip) = clip {
-                        if let Err(error) = write_clip(writer, &clip, self.config.max_bytes).await {
-                            break Err(error.into());
+                    changed = read_shutdown.changed() => {
+                        if changed.is_err() || *read_shutdown.borrow() {
+                            break Ok(());
                         }
-                        self.emit(Direction::Send, Some(node_name.clone()), &clip);
-                    }
-                }
-                changed = desired_updates.changed(), if app_version.is_some() => {
-                    if changed.is_err() {
-                        break Ok(());
-                    }
-                    let version = desired_updates.borrow_and_update().clone();
-                    if let Err(error) = write_message(
-                        writer,
-                        &Message::UpdateAvailable {
-                            update_id: Uuid::new_v4(),
-                            version,
-                        },
-                        self.config.max_bytes,
-                    ).await {
-                        break Err(error.into());
-                    }
-                }
-                changed = shutdown.changed() => {
-                    if changed.is_err() || *shutdown.borrow() {
-                        break Ok(());
                     }
                 }
             }
+        };
+        let write_loop = async {
+            loop {
+                tokio::select! {
+                    changed = receiver.changed() => {
+                        if changed.is_err() {
+                            break Ok(());
+                        }
+                        let clip = receiver.borrow_and_update().clone();
+                        if let Some(clip) = clip {
+                            if let Err(error) = write_clip(writer, &clip, self.config.max_bytes).await {
+                                break Err(error.into());
+                            }
+                            self.emit(Direction::Send, Some(node_name.clone()), &clip);
+                        }
+                    }
+                    changed = desired_updates.changed(), if app_version.is_some() => {
+                        if changed.is_err() {
+                            break Ok(());
+                        }
+                        let version = desired_updates.borrow_and_update().clone();
+                        if let Err(error) = write_message(
+                            writer,
+                            &Message::UpdateAvailable {
+                                update_id: Uuid::new_v4(),
+                                version,
+                            },
+                            self.config.max_bytes,
+                        ).await {
+                            break Err(error.into());
+                        }
+                    }
+                    changed = write_shutdown.changed() => {
+                        if changed.is_err() || *write_shutdown.borrow() {
+                            break Ok(());
+                        }
+                    }
+                }
+            }
+        };
+        let result = tokio::select! {
+            result = read_loop => result,
+            result = write_loop => result,
         };
         self.peers.write().await.remove(&connection_id);
         info!(peer = %node_name, "peer disconnected");
@@ -284,8 +332,15 @@ impl Daemon {
             return;
         }
         self.emit(Direction::Receive, Some(peer_name.to_owned()), &clip);
+        #[cfg(target_os = "macos")]
+        if self.matching_file_claim(&clip.representations).await.is_some() {
+            debug!(peer = %peer_name, clip = %clip.id, "ignored lossy file clipboard echo");
+            return;
+        }
         self.broadcast_clip(Arc::clone(&clip), Some(source)).await;
         let _guard = self.apply_lock.lock().await;
+        #[cfg(target_os = "macos")]
+        let received_file = file_conflict::has_file_bundle(&clip.representations);
         let representations = match filebundle::materialize(clip.id, &clip.representations) {
             Ok(representations) => representations,
             Err(error) => {
@@ -295,15 +350,48 @@ impl Daemon {
         };
         match self.clipboard.apply(&representations).await {
             Ok(snapshot) => {
-                *self
-                    .suppressed
-                    .lock()
-                    .await
-                    .entry(snapshot.fingerprint)
-                    .or_default() += 1;
+                let fingerprint = snapshot.fingerprint;
+                #[cfg(target_os = "macos")]
+                if received_file {
+                    let claimed = Arc::new(Clip {
+                        id: clip.id,
+                        origin: clip.origin,
+                        created_millis: clip.created_millis,
+                        representations: snapshot.representations,
+                    });
+                    self.remember_file_clip(claimed, ClaimKind::Received).await;
+                } else {
+                    self.file_claim.lock().await.take();
+                }
+                self.suppress_fingerprint(fingerprint).await;
             }
             Err(error) => warn!(%error, peer = %peer_name, clip = %clip.id, "failed to apply clipboard"),
         }
+    }
+
+    async fn suppress_fingerprint(&self, fingerprint: [u8; 32]) {
+        *self.suppressed.lock().await.entry(fingerprint).or_default() += 1;
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn remember_file_clip(&self, clip: Arc<Clip>, kind: ClaimKind) {
+        self.file_claim.lock().await.replace(FileClaim::new(clip, kind));
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn matching_file_claim(
+        &self,
+        representations: &[crate::model::Representation],
+    ) -> Option<(ClaimKind, Arc<Clip>)> {
+        let mut claim = self.file_claim.lock().await;
+        let current = claim.as_ref()?;
+        if current.expired() {
+            claim.take();
+            return None;
+        }
+        current
+            .matches_lossy_echo(representations)
+            .then(|| (current.kind(), current.clip()))
     }
 
     async fn broadcast_clip(&self, clip: Arc<Clip>, except: Option<Uuid>) {
@@ -661,6 +749,199 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(applied.representations, clip.representations);
+    }
+
+    #[tokio::test]
+    async fn simultaneous_large_clip_writes_do_not_deadlock() {
+        let config_a = Config {
+            node_name: "peer-a".into(),
+            ..Config::default()
+        };
+        let config_b = Config {
+            node_name: "peer-b".into(),
+            ..Config::default()
+        };
+        let clipboard_a = Arc::new(MockClipboard::default());
+        let clipboard_b = Arc::new(MockClipboard::default());
+        let daemon_a = Daemon::new(config_a.clone(), clipboard_a.clone());
+        let daemon_b = Daemon::new(config_b.clone(), clipboard_b.clone());
+        let (stream_a, stream_b) = duplex(1024);
+        let (mut read_a, mut write_a) = split(stream_a);
+        let (mut read_b, mut write_b) = split(stream_b);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let serving_a = Arc::clone(&daemon_a);
+        let shutdown_a = shutdown_rx.clone();
+        let task_a = tokio::spawn(async move {
+            serving_a
+                .serve_peer(&mut read_a, &mut write_a, "a", shutdown_a, None)
+                .await
+        });
+        let serving_b = Arc::clone(&daemon_b);
+        let task_b = tokio::spawn(async move {
+            serving_b
+                .serve_peer(&mut read_b, &mut write_b, "b", shutdown_rx, None)
+                .await
+        });
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if daemon_a.status().await.connected_peers == ["peer-b"]
+                    && daemon_b.status().await.connected_peers == ["peer-a"]
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        let clip_a = Arc::new(Clip::new(
+            config_a.node_id,
+            vec![Representation {
+                item: 0,
+                format: "application/octet-stream".into(),
+                data: vec![0xa5; 128 * 1024],
+            }],
+        ));
+        let clip_b = Arc::new(Clip::new(
+            config_b.node_id,
+            vec![Representation {
+                item: 0,
+                format: "application/octet-stream".into(),
+                data: vec![0x5a; 128 * 1024],
+            }],
+        ));
+        let expected_a = clip_a.representations.clone();
+        let expected_b = clip_b.representations.clone();
+
+        tokio::join!(
+            daemon_a.broadcast_clip(clip_a, None),
+            daemon_b.broadcast_clip(clip_b, None),
+        );
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let received_by_a = clipboard_a
+                    .capture()
+                    .await
+                    .unwrap()
+                    .is_some_and(|snapshot| snapshot.representations == expected_b);
+                let received_by_b = clipboard_b
+                    .capture()
+                    .await
+                    .unwrap()
+                    .is_some_and(|snapshot| snapshot.representations == expected_a);
+                if received_by_a && received_by_b {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        shutdown_tx.send(true).unwrap();
+        let _ = task_a.await.unwrap();
+        let _ = task_b.await.unwrap();
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn ignores_a_lossy_peer_echo_of_a_recent_local_file_copy() {
+        let config = Config::default();
+        let clipboard = Arc::new(MockClipboard::default());
+        let daemon = Daemon::new(config.clone(), clipboard.clone());
+        let local_file = Arc::new(Clip::new(
+            config.node_id,
+            vec![
+                Representation {
+                    item: 0,
+                    format: filebundle::BUNDLE_FORMAT.into(),
+                    data: b"bundle fixture".to_vec(),
+                },
+                Representation {
+                    item: 0,
+                    format: "public.utf8-plain-text".into(),
+                    data: b"report.pdf".to_vec(),
+                },
+            ],
+        ));
+        daemon.remember_file_clip(local_file, ClaimKind::Local).await;
+        let lossy_echo = Arc::new(Clip::new(
+            Uuid::new_v4(),
+            vec![Representation {
+                item: 0,
+                format: "NSStringPboardType".into(),
+                data: b"report.pdf".to_vec(),
+            }],
+        ));
+
+        daemon
+            .receive_clip(lossy_echo, "screen-sharing-peer", Uuid::new_v4())
+            .await;
+
+        assert!(clipboard.capture().await.unwrap().is_none());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn restores_a_received_file_after_a_lossy_local_echo() {
+        let config = Config {
+            poll_interval_ms: 20,
+            ..Config::default()
+        };
+        let clipboard = Arc::new(MockClipboard::default());
+        let native_file = vec![
+            Representation {
+                item: 0,
+                format: "public.file-url".into(),
+                data: b"file:///tmp/report.pdf".to_vec(),
+            },
+            Representation {
+                item: 0,
+                format: "public.utf8-plain-text".into(),
+                data: b"report.pdf".to_vec(),
+            },
+        ];
+        clipboard.replace(native_file.clone()).await;
+        let daemon = Daemon::new(config, clipboard.clone());
+        daemon
+            .remember_file_clip(
+                Arc::new(Clip::new(Uuid::new_v4(), native_file.clone())),
+                ClaimKind::Received,
+            )
+            .await;
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let watcher = tokio::spawn(Arc::clone(&daemon).watch_clipboard(shutdown_rx));
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        clipboard
+            .replace(vec![Representation {
+                item: 0,
+                format: "NSStringPboardType".into(),
+                data: b"report.pdf".to_vec(),
+            }])
+            .await;
+
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if clipboard
+                    .capture()
+                    .await
+                    .unwrap()
+                    .is_some_and(|snapshot| snapshot.representations == native_file)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        shutdown_tx.send(true).unwrap();
+        watcher.await.unwrap();
     }
 
     #[test]
