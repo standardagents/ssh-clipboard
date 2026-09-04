@@ -95,6 +95,35 @@ impl NativeClipboard {
         }
         #[cfg(target_os = "macos")]
         let native_files = macos::capture_file_paths()?;
+        #[cfg(target_os = "macos")]
+        if !native_files.is_empty() {
+            // Finder's TIFF representations are often a generic file icon,
+            // provided lazily. Requesting them delays capture and multiplies
+            // transfer size. File selections travel as URLs plus file bytes.
+            let mut representations = vec![Representation {
+                item: 0,
+                format: "text/uri-list".into(),
+                data: native_files
+                    .iter()
+                    .map(|path| filebundle::path_to_uri(path))
+                    .collect::<Vec<_>>()
+                    .join("\r\n")
+                    .into_bytes(),
+            }];
+            if let Ok(text) = context.get_text() {
+                representations.push(Representation {
+                    item: 0,
+                    format: "public.utf8-plain-text".into(),
+                    data: text.into_bytes(),
+                });
+            }
+            let used = representations.iter().map(|r| r.data.len() as u64).sum::<u64>();
+            if used > self.max_bytes {
+                bail!("file clipboard metadata exceeds configured limit");
+            }
+            filebundle::attach_bundle_from_paths(&mut representations, &native_files, self.max_bytes - used)?;
+            return Ok(Some(Snapshot::new(representations)));
+        }
         let mut total = 0_u64;
         let mut representations = Vec::with_capacity(formats.len());
         for format in formats {

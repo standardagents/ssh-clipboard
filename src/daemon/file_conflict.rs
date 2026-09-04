@@ -16,6 +16,7 @@ pub(super) struct FileClaim {
     clip: Arc<Clip>,
     kind: ClaimKind,
     claimed_at: Instant,
+    restore: Option<Arc<Clip>>,
 }
 
 impl FileClaim {
@@ -24,6 +25,7 @@ impl FileClaim {
             clip,
             kind,
             claimed_at: Instant::now(),
+            restore: None,
         }
     }
 
@@ -32,7 +34,12 @@ impl FileClaim {
     }
 
     pub(super) fn clip(&self) -> Arc<Clip> {
-        Arc::clone(&self.clip)
+        Arc::clone(self.restore.as_ref().unwrap_or(&self.clip))
+    }
+
+    pub(super) fn with_restore(mut self, restore: Arc<Clip>) -> Self {
+        self.restore = Some(restore);
+        self
     }
 
     pub(super) fn expired(&self) -> bool {
@@ -119,6 +126,17 @@ mod tests {
             representation("NSStringPboardType", b"report.pdf"),
             representation("public.tiff", b"generic icon"),
         ]));
+    }
+
+    #[test]
+    fn received_claim_keeps_source_filename_when_restored_clip_has_only_urls() {
+        let restored = Arc::new(Clip::new(
+            Uuid::new_v4(),
+            vec![representation("text/uri-list", b"file:///target/report.pdf")],
+        ));
+        let claim = file_claim().with_restore(Arc::clone(&restored));
+        assert!(claim.matches_lossy_echo(&[representation("NSStringPboardType", b"report.pdf")]));
+        assert_eq!(claim.clip(), restored);
     }
 
     #[test]
