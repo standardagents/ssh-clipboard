@@ -93,6 +93,8 @@ impl NativeClipboard {
         if formats.iter().any(|format| is_sensitive_marker(format)) {
             return Ok(None);
         }
+        #[cfg(target_os = "macos")]
+        let native_files = macos::capture_file_paths()?;
         let mut total = 0_u64;
         let mut representations = Vec::with_capacity(formats.len());
         for format in formats {
@@ -117,9 +119,14 @@ impl NativeClipboard {
                 data,
             });
         }
-        if let Ok(files) = context.get_files()
-            && !files.is_empty()
-        {
+        #[cfg(target_os = "macos")]
+        let files = native_files
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        #[cfg(not(target_os = "macos"))]
+        let files = context.get_files().unwrap_or_default();
+        if !files.is_empty() {
             let data = files
                 .iter()
                 .map(|file| {
@@ -169,9 +176,15 @@ impl NativeClipboard {
             .iter()
             .map(|representation| u64::try_from(representation.data.len()).unwrap_or(u64::MAX))
             .sum();
-        if let Err(error) =
-            filebundle::attach_bundle(&mut representations, self.max_bytes.saturating_sub(total))
-        {
+        #[cfg(target_os = "macos")]
+        let bundle = filebundle::attach_bundle_from_paths(
+            &mut representations,
+            &native_files,
+            self.max_bytes.saturating_sub(total),
+        );
+        #[cfg(not(target_os = "macos"))]
+        let bundle = filebundle::attach_bundle(&mut representations, self.max_bytes.saturating_sub(total));
+        if let Err(error) = bundle {
             let has_rendered_image = representations
                 .iter()
                 .any(|representation| is_image_format(&representation.format));

@@ -1,15 +1,58 @@
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use objc2::runtime::ProtocolObject;
 use objc2_app_kit::{NSPasteboard, NSPasteboardItem};
-use objc2_foundation::{NSArray, NSData, NSString};
+use objc2_foundation::{NSArray, NSData, NSString, NSURL};
 
 use crate::filebundle;
 use crate::model::Representation;
 
 use super::{is_file_format, is_internal_marker, is_sensitive_marker};
+
+pub(super) fn capture_file_paths() -> Result<Vec<PathBuf>> {
+    let pasteboard = NSPasteboard::generalPasteboard();
+    capture_file_paths_from(&pasteboard)
+}
+
+fn capture_file_paths_from(pasteboard: &NSPasteboard) -> Result<Vec<PathBuf>> {
+    let Some(items) = pasteboard.pasteboardItems() else {
+        return Ok(Vec::new());
+    };
+    let file_url_type = NSString::from_str("public.file-url");
+    let file_url_types = NSArray::from_retained_slice(std::slice::from_ref(&file_url_type));
+    let mut paths = Vec::new();
+    let mut advertised_file = false;
+
+    for item in items {
+        if item.availableTypeFromArray(&file_url_types).is_none() {
+            continue;
+        }
+        advertised_file = true;
+        let value = item
+            .stringForType(&file_url_type)
+            .context("read a macOS clipboard file URL")?;
+        let url = NSURL::URLWithString(&value).context("parse a macOS clipboard file URL")?;
+        if !url.isFileURL() {
+            bail!("macOS clipboard advertised a non-file URL as a file");
+        }
+        let path_url = url
+            .filePathURL()
+            .context("resolve a macOS clipboard file reference URL")?;
+        let path = path_url.path().context("resolve a macOS clipboard file path")?;
+        let path = PathBuf::from(path.to_string());
+        std::fs::metadata(&path).with_context(|| format!("access copied file {}", path.display()))?;
+        paths.push(path);
+    }
+
+    if advertised_file && paths.is_empty() {
+        bail!("macOS clipboard advertised files but none could be resolved");
+    }
+    let mut seen = HashSet::new();
+    paths.retain(|path| seen.insert(path.clone()));
+    Ok(paths)
+}
 
 pub(super) fn publish_single_file(path: &Path, representations: &[Representation]) -> Result<()> {
     let pasteboard = NSPasteboard::generalPasteboard();
@@ -171,5 +214,44 @@ mod tests {
             detect_image_format(Path::new("attachment.webp"), b"not enough bytes"),
             Some("org.webmproject.webp")
         );
+    }
+
+    #[test]
+    fn resolves_native_file_urls_from_the_pasteboard() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first file.txt");
+        let second = directory.path().join("second file.txt");
+        std::fs::write(&first, "first").unwrap();
+        std::fs::write(&second, "second").unwrap();
+        let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+        let urls = [
+            NSURL::fileURLWithPath(&NSString::from_str(&first.to_string_lossy())),
+            NSURL::fileURLWithPath(&NSString::from_str(&second.to_string_lossy())),
+        ];
+        let objects = NSArray::from_retained_slice(
+            &urls
+                .into_iter()
+                .map(ProtocolObject::from_retained)
+                .collect::<Vec<_>>(),
+        );
+        pasteboard.clearContents();
+        assert!(pasteboard.writeObjects(&objects));
+
+        assert_eq!(capture_file_paths_from(&pasteboard).unwrap(), [first, second]);
+    }
+
+    #[test]
+    fn rejects_an_unresolvable_advertised_file() {
+        let pasteboard = NSPasteboard::pasteboardWithUniqueName();
+        let item = NSPasteboardItem::new();
+        assert!(item.setString_forType(
+            &NSString::from_str("file:///definitely/missing/ssh-clipboard-test"),
+            &NSString::from_str("public.file-url"),
+        ));
+        let objects = NSArray::from_retained_slice(&[ProtocolObject::from_retained(item)]);
+        pasteboard.clearContents();
+        assert!(pasteboard.writeObjects(&objects));
+
+        assert!(capture_file_paths_from(&pasteboard).is_err());
     }
 }

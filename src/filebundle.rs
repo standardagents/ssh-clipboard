@@ -48,17 +48,26 @@ enum EntryKind {
 }
 
 pub fn attach_bundle(representations: &mut Vec<Representation>, max_remaining: u64) -> Result<()> {
+    let source_paths = representations
+        .iter()
+        .filter(|representation| is_uri_format(&representation.format))
+        .flat_map(|representation| parse_uri_candidates(&representation.data))
+        .collect::<Vec<_>>();
+    attach_bundle_from_paths(representations, &source_paths, max_remaining)
+}
+
+pub(crate) fn attach_bundle_from_paths(
+    representations: &mut Vec<Representation>,
+    source_paths: &[PathBuf],
+    max_remaining: u64,
+) -> Result<()> {
     if representations
         .iter()
         .any(|representation| representation.format == BUNDLE_FORMAT)
     {
         return Ok(());
     }
-    let mut source_paths = representations
-        .iter()
-        .filter(|representation| is_uri_format(&representation.format))
-        .flat_map(|representation| parse_uri_list(&representation.data))
-        .collect::<Vec<_>>();
+    let mut source_paths = source_paths.to_vec();
     let mut seen = HashSet::new();
     source_paths.retain(|path| seen.insert(path.clone()));
     if source_paths.is_empty() {
@@ -113,13 +122,20 @@ pub fn materialize(clip_id: Uuid, representations: &[Representation]) -> Result<
     Ok(rewritten)
 }
 
+#[must_use]
 pub fn parse_uri_list(bytes: &[u8]) -> Vec<PathBuf> {
+    parse_uri_candidates(bytes)
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn parse_uri_candidates(bytes: &[u8]) -> Vec<PathBuf> {
     String::from_utf8_lossy(bytes)
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .filter_map(uri_to_path)
-        .filter(|path| path.exists())
         .collect()
 }
 
@@ -467,6 +483,40 @@ mod tests {
         assert_eq!(files.len(), 2);
         assert_eq!(fs::read_to_string(&files[0]).unwrap(), "first");
         assert_eq!(fs::read_to_string(&files[1]).unwrap(), "second");
+    }
+
+    #[test]
+    fn explicit_native_paths_create_a_bundle_without_a_uri_representation() {
+        let source = tempfile::tempdir().unwrap();
+        let path = source.path().join("native.txt");
+        fs::write(&path, "native").unwrap();
+        let mut representations = Vec::new();
+
+        attach_bundle_from_paths(&mut representations, std::slice::from_ref(&path), 1024).unwrap();
+
+        let bundle = representations
+            .iter()
+            .find(|representation| representation.format == BUNDLE_FORMAT)
+            .unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let files = decode(&bundle.data, &target.path().join("decoded")).unwrap();
+        assert_eq!(fs::read_to_string(&files[0]).unwrap(), "native");
+    }
+
+    #[test]
+    fn an_unreachable_file_url_is_an_error_instead_of_filename_only_success() {
+        let mut representations = vec![Representation {
+            item: 0,
+            format: "public.file-url".into(),
+            data: b"file:///definitely/missing/ssh-clipboard-test".to_vec(),
+        }];
+
+        assert!(attach_bundle(&mut representations, 1024).is_err());
+        assert!(
+            !representations
+                .iter()
+                .any(|representation| representation.format == BUNDLE_FORMAT)
+        );
     }
 
     #[test]
