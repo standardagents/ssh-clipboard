@@ -1,6 +1,6 @@
 [package]
 name = "ssh-clipboard"
-version = "0.2.9"
+version = "0.2.10"
 edition = "2024"
 rust-version = "1.88"
 description = "Native, encrypted clipboard sync over SSH"

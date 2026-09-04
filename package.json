@@ -1,6 +1,6 @@
 {
   "name": "ssh-clipboard",
-  "version": "0.2.9",
+  "version": "0.2.10",
   "description": "Native, encrypted clipboard sync over SSH for macOS and Linux",
   "license": "MIT",
   "repository": {
