@@ -8,6 +8,8 @@ use objc2_foundation::{NSArray, NSString, NSURL};
 
 use crate::filebundle;
 
+pub(crate) mod file_access;
+
 pub(super) fn capture_file_paths() -> Result<Vec<PathBuf>> {
     let pasteboard = NSPasteboard::generalPasteboard();
     capture_file_paths_from(&pasteboard)
@@ -39,7 +41,7 @@ fn capture_file_paths_from(pasteboard: &NSPasteboard) -> Result<Vec<PathBuf>> {
             .context("resolve a macOS clipboard file reference URL")?;
         let path = path_url.path().context("resolve a macOS clipboard file path")?;
         let path = PathBuf::from(path.to_string());
-        std::fs::metadata(&path).with_context(|| format!("access copied file {}", path.display()))?;
+        std::fs::symlink_metadata(&path).with_context(|| format!("access copied file {}", path.display()))?;
         paths.push(path);
     }
 
@@ -64,7 +66,7 @@ fn publish_files_to(pasteboard: &NSPasteboard, paths: &[PathBuf]) -> Result<()> 
     let file_url_type = NSString::from_str("public.file-url");
     let mut objects = Vec::with_capacity(paths.len());
     for path in paths {
-        if !path.exists() {
+        if std::fs::symlink_metadata(path).is_err() {
             bail!("clipboard file does not exist: {}", path.display());
         }
 

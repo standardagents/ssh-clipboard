@@ -1,3 +1,4 @@
+mod capture_retry;
 mod client;
 #[cfg(target_os = "macos")]
 mod file_conflict;
@@ -126,20 +127,29 @@ impl Daemon {
     }
 
     async fn watch_clipboard(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
-        let mut previous = self.clipboard.capture().await.ok().flatten();
+        let mut retry = capture_retry::CaptureRetry::default();
+        let mut previous = match self.clipboard.capture().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                warn!(error = %format!("{error:#}"), "initial clipboard capture failed");
+                retry.failed();
+                None
+            }
+        };
         let poll = Duration::from_millis(self.config.poll_interval_ms);
         let mut changes = self.clipboard.change_receiver(poll);
         let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_interval_ms));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
-                () = next_clipboard_change(&mut changes, &mut interval) => {
+                () = retry.next(&mut changes, &mut interval) => {
                     let _guard = self.apply_lock.lock().await;
                     let snapshot = match self.clipboard.capture().await {
-                        Ok(Some(snapshot)) => snapshot,
-                        Ok(None) => continue,
+                        Ok(Some(snapshot)) => { retry.reset(); snapshot },
+                        Ok(None) => { retry.reset(); continue; },
                         Err(error) => {
                             warn!(error = %format!("{error:#}"), "clipboard capture failed");
+                            retry.failed();
                             continue;
                         }
                     };

@@ -12,6 +12,8 @@ use crate::config::{ensure_private_dir, paths};
 use crate::model::Representation;
 
 pub const BUNDLE_FORMAT: &str = "application/x-ssh-clipboard-file-bundle";
+#[cfg(test)]
+mod finder_tests;
 const MAGIC: &[u8; 5] = b"SCBF1";
 const URI_ENCODE: &AsciiSet = &CONTROLS
     .add(b' ')
@@ -38,6 +40,8 @@ struct Entry {
     size: u64,
     #[serde(default)]
     mode: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    link_target: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -45,6 +49,7 @@ struct Entry {
 enum EntryKind {
     File,
     Directory,
+    Symlink,
 }
 
 pub fn attach_bundle(representations: &mut Vec<Representation>, max_remaining: u64) -> Result<()> {
@@ -102,23 +107,18 @@ pub fn materialize(clip_id: Uuid, representations: &[Representation]) -> Result<
         .into_bytes();
     let mut rewritten = representations
         .iter()
-        .filter(|representation| representation.format != BUNDLE_FORMAT)
+        .filter(|representation| {
+            representation.format != BUNDLE_FORMAT
+                && !is_uri_format(&representation.format)
+                && representation.format != "application/x-kde-cutselection"
+        })
         .cloned()
         .collect::<Vec<_>>();
-    let mut replaced = false;
-    for representation in &mut rewritten {
-        if is_uri_format(&representation.format) {
-            representation.data.clone_from(&uri_bytes);
-            replaced = true;
-        }
-    }
-    if !replaced {
-        rewritten.push(Representation {
-            item: 0,
-            format: "text/uri-list".into(),
-            data: uri_bytes,
-        });
-    }
+    rewritten.push(Representation {
+        item: 0,
+        format: "text/uri-list".into(),
+        data: uri_bytes,
+    });
     Ok(rewritten)
 }
 
@@ -126,7 +126,7 @@ pub fn materialize(clip_id: Uuid, representations: &[Representation]) -> Result<
 pub fn parse_uri_list(bytes: &[u8]) -> Vec<PathBuf> {
     parse_uri_candidates(bytes)
         .into_iter()
-        .filter(|path| path.exists())
+        .filter(|path| fs::symlink_metadata(path).is_ok())
         .collect()
 }
 
@@ -148,10 +148,9 @@ fn encode(sources: &[PathBuf], max_bytes: u64) -> Result<Vec<u8>> {
     let mut used_roots = HashSet::new();
     let mut total = 0_u64;
     for source in sources {
-        let canonical = source
-            .canonicalize()
-            .with_context(|| format!("resolve copied file {}", source.display()))?;
-        let base = canonical
+        // Do not canonicalize: Finder copies the selected link itself, and
+        // resolving it could also rename the selection or copy unrelated data.
+        let base = source
             .file_name()
             .and_then(|name| name.to_str())
             .filter(|name| !name.is_empty())
@@ -159,7 +158,7 @@ fn encode(sources: &[PathBuf], max_bytes: u64) -> Result<Vec<u8>> {
         let root = unique_name(base, &mut used_roots);
         manifest.roots.push(root.clone());
         collect_entries(
-            &canonical,
+            source,
             Path::new(&root),
             &mut manifest.entries,
             &mut bodies,
@@ -195,8 +194,40 @@ fn collect_entries(
     total: &mut u64,
     max_bytes: u64,
 ) -> Result<()> {
-    let metadata = fs::symlink_metadata(source)?;
+    #[cfg(target_os = "macos")]
+    {
+        crate::clipboard::macos::file_access::coordinated_read(source, |source| {
+            collect_accessible_entries(source, relative, entries, bodies, total, max_bytes)
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    collect_accessible_entries(source, relative, entries, bodies, total, max_bytes)
+}
+
+fn collect_accessible_entries(
+    source: &Path,
+    relative: &Path,
+    entries: &mut Vec<Entry>,
+    bodies: &mut Vec<Vec<u8>>,
+    total: &mut u64,
+    max_bytes: u64,
+) -> Result<()> {
+    let metadata =
+        fs::symlink_metadata(source).with_context(|| format!("inspect copied item {}", source.display()))?;
     if metadata.file_type().is_symlink() {
+        let target = fs::read_link(source)?;
+        entries.push(Entry {
+            path: relative_to_string(relative)?,
+            kind: EntryKind::Symlink,
+            size: 0,
+            mode: 0,
+            link_target: Some(
+                target
+                    .to_str()
+                    .context("non-UTF-8 symbolic link target")?
+                    .to_owned(),
+            ),
+        });
         return Ok(());
     }
     if metadata.is_dir() {
@@ -205,8 +236,11 @@ fn collect_entries(
             kind: EntryKind::Directory,
             size: 0,
             mode: mode(&metadata),
+            link_target: None,
         });
-        let mut children = fs::read_dir(source)?.collect::<std::io::Result<Vec<_>>>()?;
+        let mut children = fs::read_dir(source)
+            .with_context(|| format!("read copied folder {}", source.display()))?
+            .collect::<std::io::Result<Vec<_>>>()?;
         children.sort_by_key(std::fs::DirEntry::file_name);
         for child in children {
             collect_entries(
@@ -224,7 +258,7 @@ fn collect_entries(
         if next_total > max_bytes {
             bail!("copied files total {next_total} bytes; remaining clipboard limit is {max_bytes}");
         }
-        let data = fs::read(source)?;
+        let data = fs::read(source).with_context(|| format!("read copied file {}", source.display()))?;
         if u64::try_from(data.len()).context("copied file is too large")? != size {
             bail!("copied file changed while it was being read");
         }
@@ -234,8 +268,14 @@ fn collect_entries(
             kind: EntryKind::File,
             size,
             mode: mode(&metadata),
+            link_target: None,
         });
         bodies.push(data);
+    } else {
+        bail!(
+            "unsupported filesystem item {} (not a file, folder, or symbolic link)",
+            source.display()
+        );
     }
     Ok(())
 }
@@ -261,6 +301,7 @@ fn decode(bytes: &[u8], destination: &Path) -> Result<Vec<PathBuf>> {
         .iter()
         .map(|root| safe_relative(root))
         .collect::<Result<Vec<_>>>()?;
+    validate_entries(&manifest)?;
     let mut body_bytes = 0_u64;
     for entry in &manifest.entries {
         safe_relative(&entry.path)?;
@@ -282,7 +323,7 @@ fn decode(bytes: &[u8], destination: &Path) -> Result<Vec<PathBuf>> {
             .iter()
             .map(|root| destination.join(root))
             .collect::<Vec<_>>();
-        if materialized.iter().all(|path| path.exists()) {
+        if materialized.iter().all(|path| fs::symlink_metadata(path).is_ok()) {
             return Ok(materialized);
         }
         bail!("existing copied-file bundle is incomplete");
@@ -292,6 +333,9 @@ fn decode(bytes: &[u8], destination: &Path) -> Result<Vec<PathBuf>> {
         let relative = safe_relative(&entry.path)?;
         let path = destination.join(relative);
         match entry.kind {
+            // Links are created last, so no extraction write can follow a
+            // peer-supplied link outside the private staging directory.
+            EntryKind::Symlink => {}
             EntryKind::Directory => fs::create_dir_all(&path)?,
             EntryKind::File => {
                 if let Some(parent) = path.parent() {
@@ -305,7 +349,25 @@ fn decode(bytes: &[u8], destination: &Path) -> Result<Vec<PathBuf>> {
                 file.sync_all()?;
             }
         }
-        set_mode(&path, entry.mode)?;
+    }
+    for entry in manifest.entries.iter().rev() {
+        let path = destination.join(&entry.path);
+        if matches!(entry.kind, EntryKind::Symlink) {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            create_symlink(
+                entry
+                    .link_target
+                    .as_deref()
+                    .context("missing symbolic link target")?,
+                &path,
+            )?;
+        } else {
+            // Restrictive directory permissions must not prevent extracting
+            // their children. Never chmod a symbolic link's target.
+            set_mode(&path, entry.mode)?;
+        }
     }
     if cursor.position() != u64::try_from(bytes.len()).unwrap_or(u64::MAX) {
         bail!("copied-file bundle contains trailing data");
@@ -314,10 +376,55 @@ fn decode(bytes: &[u8], destination: &Path) -> Result<Vec<PathBuf>> {
         .iter()
         .map(|root| destination.join(root))
         .collect::<Vec<_>>();
-    if !materialized.iter().all(|path| path.exists()) {
+    if !materialized.iter().all(|path| fs::symlink_metadata(path).is_ok()) {
         bail!("copied-file bundle did not materialize every root");
     }
     Ok(materialized)
+}
+
+fn validate_entries(manifest: &Manifest) -> Result<()> {
+    let mut kinds = std::collections::HashMap::new();
+    for entry in &manifest.entries {
+        let path = safe_relative(&entry.path)?;
+        if kinds.insert(path, entry.kind).is_some() {
+            bail!("duplicate path in copied-file manifest");
+        }
+        if matches!(entry.kind, EntryKind::Symlink)
+            && entry
+                .link_target
+                .as_ref()
+                .is_none_or(|target| target.is_empty() || target.contains('\0'))
+        {
+            bail!("invalid symbolic link target");
+        }
+    }
+    for path in kinds.keys() {
+        for ancestor in path.ancestors().skip(1) {
+            if kinds
+                .get(ancestor)
+                .is_some_and(|kind| !matches!(kind, EntryKind::Directory))
+            {
+                bail!("copied-file path has a non-directory ancestor");
+            }
+        }
+    }
+    for root in &manifest.roots {
+        if !kinds.contains_key(&safe_relative(root)?) {
+            bail!("copied-file root missing from manifest");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn create_symlink(target: &str, path: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(target, path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_symlink(_target: &str, _path: &Path) -> Result<()> {
+    bail!("symbolic link transfer is unsupported on this platform");
 }
 
 fn safe_relative(value: &str) -> Result<PathBuf> {
@@ -355,7 +462,11 @@ fn unique_name(base: &str, used: &mut HashSet<String>) -> String {
 fn is_uri_format(format: &str) -> bool {
     matches!(
         format,
-        "text/uri-list" | "public.file-url" | "NSFilenamesPboardType"
+        "text/uri-list"
+            | "public.file-url"
+            | "NSFilenamesPboardType"
+            | "x-special/gnome-copied-files"
+            | "x-special/nautilus-clipboard"
     )
 }
 
@@ -431,6 +542,7 @@ mod tests {
                 kind: EntryKind::File,
                 size: 0,
                 mode: 0,
+                link_target: None,
             }],
         };
         let header = serde_json::to_vec(&manifest).unwrap();

@@ -41,6 +41,51 @@ fn headless_x11_round_trip() {
                     .iter()
                     .any(|representation| { representation.data == b"headless clipboard smoke test" })
             );
+            // Exercise the real X11 owner, not just a MIME serialization unit
+            // test. Finder bundles must become local, encoded file references.
+            let source = tempfile::tempdir().unwrap();
+            let target = tempfile::tempdir().unwrap();
+            let paths = ["Manual #1.pdf", "Disk.dmg", "Installer.pkg"].map(|name| source.path().join(name));
+            for path in &paths {
+                std::fs::write(path, [0, 1, 2, 255]).unwrap();
+            }
+            let mut files = vec![Representation {
+                item: 0,
+                format: "text/uri-list".into(),
+                data: paths
+                    .iter()
+                    .map(|path| ssh_clipboard::filebundle::path_to_uri(path))
+                    .collect::<Vec<_>>()
+                    .join("\r\n")
+                    .into_bytes(),
+            }];
+            ssh_clipboard::filebundle::attach_bundle(&mut files, 1_000_000).unwrap();
+            // Materialization uses a process-local temporary state directory.
+            // The child environment below isolates this from real user data.
+            let local_files = ssh_clipboard::filebundle::materialize(uuid::Uuid::new_v4(), &files).unwrap();
+            clipboard.apply(&local_files).await.unwrap();
+            let captured = clipboard.capture().await.unwrap().unwrap();
+            let uri_list = captured
+                .representations
+                .iter()
+                .find(|r| r.format == "text/uri-list")
+                .unwrap();
+            let received = ssh_clipboard::filebundle::parse_uri_list(&uri_list.data);
+            assert_eq!(received.len(), paths.len());
+            for (received, original) in received.iter().zip(&paths) {
+                assert_ne!(received, original);
+                // Simulate the file manager's copy operation from its local URL.
+                let pasted = target.path().join(received.file_name().unwrap());
+                std::fs::copy(received, &pasted).unwrap();
+                assert_eq!(std::fs::read(pasted).unwrap(), [0, 1, 2, 255]);
+            }
+            let gnome = captured
+                .representations
+                .iter()
+                .find(|r| r.format == "x-special/gnome-copied-files")
+                .unwrap();
+            assert!(gnome.data.starts_with(b"copy\nfile://"));
+            assert!(String::from_utf8_lossy(&uri_list.data).contains("Manual%20%231.pdf"));
         });
         return;
     }
@@ -76,10 +121,12 @@ fn headless_x11_round_trip() {
         "Xvfb did not become ready"
     );
 
+    let state = tempfile::tempdir().unwrap();
     let status = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "headless_x11_round_trip", "--nocapture"])
         .env(CHILD_MARKER, "1")
         .env("DISPLAY", DISPLAY)
+        .env("XDG_STATE_HOME", state.path())
         .env_remove("WAYLAND_DISPLAY")
         .status()
         .unwrap();

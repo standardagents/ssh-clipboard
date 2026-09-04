@@ -40,6 +40,28 @@ ssh-clipboard update --check   # compare this node with npm @latest
 
 The manual update command also reconciles the per-user service, so it can recover an installed binary whose launchd or systemd job is missing.
 
+### Copying files
+
+Copy files or folders in Finder, wait for the transfer to finish in `ssh-clipboard monitor`,
+then paste into a Finder folder on the other Mac. Transfers are extension-independent:
+PDFs, DMGs, PKGs, images, documents, and unknown file types all use the same byte-transfer
+path. Folders, empty directories, executable permissions, and symbolic links are preserved.
+Copying does not install or execute anything, and does not delete the source.
+
+On Linux, a running graphical clipboard (X11 or supported Wayland session) is required.
+The receiver publishes local file URLs with GNOME/Nautilus and KDE copy formats;
+macOS applications and installers remain files, not Linux-compatible applications.
+macOS-only metadata such as resource forks and extended attributes is not currently
+preserved. Both peers must run the current version for symbolic-link transfers.
+
+The configured `max_bytes` limit applies to the **whole selection**, including transfer
+metadata (256 MiB by default). Larger selections require raising it on both peers and
+restarting their services. Transfers are currently buffered in memory, so choose a limit
+that both machines can accommodate; large files are not instantaneous.
+
+When using Apple's Screen Sharing, turn off **Edit → Use Shared Clipboard** to avoid
+its separate filename-only clipboard updates competing with ssh-clipboard.
+
 ### Headless Linux
 
 Linux servers without Wayland or X11 need a virtual display before they have a clipboard.

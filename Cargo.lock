@@ -2426,6 +2426,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "block2",
  "clap",
  "clipboard-rs",
  "flate2",

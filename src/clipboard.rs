@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -13,7 +13,10 @@ use crate::model::Representation;
 use crate::{filebundle, filebundle::BUNDLE_FORMAT};
 
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
+
+#[cfg(any(target_os = "linux", test))]
+mod linux_files;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
@@ -49,8 +52,9 @@ pub trait ClipboardBackend: Send + Sync {
 }
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
+#[derive(Clone)]
 pub struct NativeClipboard {
-    context: Mutex<clipboard_rs::ClipboardContext>,
+    context: Arc<Mutex<clipboard_rs::ClipboardContext>>,
     max_bytes: u64,
 }
 
@@ -71,7 +75,7 @@ impl NativeClipboard {
         let context = ClipboardContext::new()
             .map_err(|error| anyhow::anyhow!("initialize native clipboard: {error}"))?;
         Ok(Self {
-            context: Mutex::new(context),
+            context: Arc::new(Mutex::new(context)),
             max_bytes,
         })
     }
@@ -93,6 +97,8 @@ impl NativeClipboard {
         if formats.iter().any(|format| is_sensitive_marker(format)) {
             return Ok(None);
         }
+        #[cfg(target_os = "macos")]
+        let change_count = objc2_app_kit::NSPasteboard::generalPasteboard().changeCount();
         #[cfg(target_os = "macos")]
         let native_files = macos::capture_file_paths()?;
         #[cfg(target_os = "macos")]
@@ -122,6 +128,9 @@ impl NativeClipboard {
                 bail!("file clipboard metadata exceeds configured limit");
             }
             filebundle::attach_bundle_from_paths(&mut representations, &native_files, self.max_bytes - used)?;
+            if objc2_app_kit::NSPasteboard::generalPasteboard().changeCount() != change_count {
+                bail!("clipboard changed while copied files were being read");
+            }
             return Ok(Some(Snapshot::new(representations)));
         }
         let mut total = 0_u64;
@@ -245,6 +254,21 @@ impl NativeClipboard {
         }
         let mut contents = Vec::with_capacity(representations.len());
         let native_files = clipboard_file_paths(representations);
+        #[cfg(target_os = "linux")]
+        if !native_files.is_empty() {
+            let contents = linux_files::representations(&native_files)
+                .into_iter()
+                .map(|representation| ClipboardContent::Other(representation.format, representation.data))
+                .collect();
+            self.context
+                .lock()
+                .map_err(|_| anyhow::anyhow!("clipboard lock poisoned"))?
+                .set(contents)
+                .map_err(|error| anyhow::anyhow!("publish native file clipboard: {error}"))?;
+            return self
+                .capture_sync()?
+                .context("native file clipboard was empty after publishing");
+        }
         #[cfg(target_os = "macos")]
         if !native_files.is_empty() {
             let context = self
@@ -299,11 +323,14 @@ impl NativeClipboard {
 #[async_trait]
 impl ClipboardBackend for NativeClipboard {
     async fn capture(&self) -> Result<Option<Snapshot>> {
-        self.capture_sync()
+        let clipboard = self.clone();
+        tokio::task::spawn_blocking(move || clipboard.capture_sync()).await?
     }
 
     async fn apply(&self, representations: &[Representation]) -> Result<Snapshot> {
-        self.apply_sync(representations)
+        let clipboard = self.clone();
+        let representations = representations.to_vec();
+        tokio::task::spawn_blocking(move || clipboard.apply_sync(&representations)).await?
     }
 
     fn name(&self) -> &'static str {
@@ -382,7 +409,11 @@ fn is_internal_marker(format: &str) -> bool {
 fn is_file_format(format: &str) -> bool {
     matches!(
         format,
-        "text/uri-list" | "public.file-url" | "NSFilenamesPboardType"
+        "text/uri-list"
+            | "public.file-url"
+            | "NSFilenamesPboardType"
+            | "x-special/gnome-copied-files"
+            | "x-special/nautilus-clipboard"
     )
 }
 

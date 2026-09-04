@@ -6,6 +6,58 @@ use super::*;
 use crate::clipboard::test_support::MockClipboard;
 use crate::model::Representation;
 
+#[tokio::test]
+async fn retries_a_failed_file_capture_without_another_copy_notification() {
+    use crate::clipboard::Snapshot;
+    use std::sync::atomic::AtomicUsize;
+
+    struct TransientClipboard {
+        calls: AtomicUsize,
+        receiver: std::sync::Mutex<Option<mpsc::UnboundedReceiver<()>>>,
+    }
+    #[async_trait::async_trait]
+    impl ClipboardBackend for TransientClipboard {
+        async fn capture(&self) -> Result<Option<Snapshot>> {
+            match self.calls.fetch_add(1, Ordering::SeqCst) {
+                0 => Ok(None),
+                1 => bail!("temporary file-provider read failure"),
+                _ => Ok(Some(Snapshot::new(vec![Representation {
+                    item: 0,
+                    format: "text/plain".into(),
+                    data: b"retried".to_vec(),
+                }]))),
+            }
+        }
+        async fn apply(&self, _: &[Representation]) -> Result<Snapshot> {
+            unreachable!()
+        }
+        fn name(&self) -> &'static str {
+            "transient-test"
+        }
+        fn change_receiver(&self, _: Duration) -> Option<mpsc::UnboundedReceiver<()>> {
+            self.receiver.lock().unwrap().take()
+        }
+    }
+    let (change_tx, change_rx) = mpsc::unbounded_channel();
+    let clipboard = Arc::new(TransientClipboard {
+        calls: AtomicUsize::new(0),
+        receiver: std::sync::Mutex::new(Some(change_rx)),
+    });
+    let daemon = Daemon::new(Config::default(), clipboard);
+    let mut events = daemon.events.subscribe();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let watcher = tokio::spawn(daemon.watch_clipboard(shutdown_rx));
+    change_tx.send(()).unwrap();
+    let event = timeout(Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.direction, Direction::Local);
+    assert_eq!(event.preview, "retried");
+    shutdown_tx.send(true).unwrap();
+    watcher.await.unwrap();
+}
+
 #[test]
 fn status_from_an_older_daemon_defaults_version_fields() {
     let status: Status = serde_json::from_value(serde_json::json!({
