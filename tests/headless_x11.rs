@@ -27,11 +27,18 @@ fn headless_x11_round_trip() {
             let clipboard = NativeClipboard::new(1024 * 1024).unwrap();
             assert_eq!(clipboard.name(), "X11");
             clipboard
-                .apply(&[Representation {
-                    item: 0,
-                    format: "text/plain".into(),
-                    data: b"headless clipboard smoke test".to_vec(),
-                }])
+                .apply(&[
+                    Representation {
+                        item: 0,
+                        format: "text/plain".into(),
+                        data: b"headless clipboard smoke test".to_vec(),
+                    },
+                    Representation {
+                        item: 0,
+                        format: "text/x-ssh-clipboard-probe".into(),
+                        data: b"headless clipboard smoke test".to_vec(),
+                    },
+                ])
                 .await
                 .unwrap();
             let snapshot = clipboard.capture().await.unwrap().unwrap();
@@ -39,7 +46,15 @@ fn headless_x11_round_trip() {
                 snapshot
                     .representations
                     .iter()
-                    .any(|representation| { representation.data == b"headless clipboard smoke test" })
+                    .any(|representation| representation.format == "text/plain"
+                        && representation.data == b"headless clipboard smoke test")
+            );
+            assert!(
+                snapshot
+                    .representations
+                    .iter()
+                    .any(|representation| representation.format == "text/x-ssh-clipboard-probe"),
+                "arbitrary MIME names must pass through the X11 backend unchanged"
             );
         });
         return;

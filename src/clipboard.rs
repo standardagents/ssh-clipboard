@@ -1,4 +1,5 @@
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -222,23 +223,14 @@ impl NativeClipboard {
             // otherwise valid file selection non-pasteable in Finder.
             contents.push(ClipboardContent::Files(native_files));
         } else {
-            let mut added_files = false;
-            for representation in representations {
-                if representation.format.trim().is_empty()
-                    || is_internal_marker(&representation.format)
-                    || is_sensitive_marker(&representation.format)
-                {
-                    continue;
-                }
-                if is_file_format(&representation.format) && !added_files && !native_files.is_empty() {
-                    contents.push(ClipboardContent::Files(native_files.clone()));
-                    added_files = true;
-                    continue;
-                }
-                contents.push(ClipboardContent::Other(
-                    representation.format.clone(),
-                    representation.data.clone(),
-                ));
+            let files_published = !native_files.is_empty();
+            if files_published {
+                contents.push(ClipboardContent::Files(native_files));
+            }
+            for (native_format, data) in
+                generic_publish_entries(representations, publish_target(), files_published)
+            {
+                contents.push(ClipboardContent::Other(native_format.into_owned(), data.to_vec()));
             }
         }
         if contents.is_empty() {
@@ -386,6 +378,148 @@ fn clipboard_file_paths(representations: &[Representation]) -> Vec<String> {
         .filter(|path| seen.insert(path.clone()))
         .map(|path| path.to_string_lossy().into_owned())
         .collect()
+}
+
+/// Which native backend a representation's type string is being published to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PublishTarget {
+    /// macOS `NSPasteboard`: the type must be a valid Uniform Type Identifier.
+    AppKit,
+    /// `wl-clipboard` and X11: arbitrary MIME-type and selection-atom strings
+    /// are accepted verbatim.
+    Passthrough,
+}
+
+/// The publish target for the backend compiled into this build.
+const fn publish_target() -> PublishTarget {
+    if cfg!(target_os = "macos") {
+        PublishTarget::AppKit
+    } else {
+        PublishTarget::Passthrough
+    }
+}
+
+/// Translates a wire clipboard format name into the type string the local
+/// native backend accepts when publishing, or `None` when the backend cannot
+/// represent it and the representation must be dropped.
+///
+/// X11 selection atoms (`STRING`, `TEXT`, `UTF8_STRING`) and raw MIME types
+/// (`text/plain`, `text/html`) are not valid UTIs; modern `AppKit` silently
+/// discards them and leaves the pasteboard empty
+/// (standardagents/ssh-clipboard#8). `wl-copy` and X11 accept any string, so
+/// the passthrough target returns every name unchanged.
+fn publish_format(format: &str, target: PublishTarget) -> Option<Cow<'_, str>> {
+    match target {
+        PublishTarget::Passthrough => Some(Cow::Borrowed(format)),
+        PublishTarget::AppKit => {
+            if let Some(uti) = appkit_uti(format) {
+                Some(Cow::Borrowed(uti))
+            } else if is_uti_like(format) {
+                Some(Cow::Borrowed(format))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// Preference among wire format names that collapse to the same native type.
+/// Higher wins. UTF-8-explicit text sources outrank the legacy X11 `STRING`
+/// and `TEXT` atoms, whose bytes are Latin-1 under ICCCM.
+fn source_rank(format: &str) -> u8 {
+    match format.trim().to_ascii_lowercase().as_str() {
+        "public.utf8-plain-text" => 5,
+        "utf8_string" | "text/plain;charset=utf-8" | "text/html;charset=utf-8" => 4,
+        "string" => 1,
+        "text" => 2,
+        _ => 3,
+    }
+}
+
+/// Resolves the ordered, de-duplicated `(native type, bytes)` pairs to publish
+/// as generic pasteboard data for a clip's non-file representations.
+///
+/// Empty, internal-marker, and sensitive-marker formats are skipped. File-URL
+/// formats are skipped only when `files_published` is set (the caller already
+/// pushed a `ClipboardContent::Files` entry); otherwise an unresolvable
+/// `text/uri-list` — e.g. an `https://` list from a browser — is passed through
+/// so non-macOS backends do not regress. Remaining names are normalized through
+/// [`publish_format`]; when several wire names collapse to the same native type,
+/// the bytes from the highest-ranked source name are kept (see [`source_rank`]);
+/// distinct native types keep their first-seen order.
+fn generic_publish_entries(
+    representations: &[Representation],
+    target: PublishTarget,
+    files_published: bool,
+) -> Vec<(Cow<'_, str>, &[u8])> {
+    let mut index_by_type: HashMap<String, usize> = HashMap::new();
+    let mut entries: Vec<(Cow<'_, str>, &[u8], u8)> = Vec::with_capacity(representations.len());
+    for representation in representations {
+        let format = representation.format.as_str();
+        if format.trim().is_empty()
+            || is_internal_marker(format)
+            || is_sensitive_marker(format)
+            || (is_file_format(format) && files_published)
+        {
+            continue;
+        }
+        let Some(native_format) = publish_format(format, target) else {
+            continue;
+        };
+        let rank = source_rank(format);
+        match index_by_type.get(native_format.as_ref()) {
+            Some(&i) if rank > entries[i].2 => {
+                entries[i] = (native_format, representation.data.as_slice(), rank);
+            }
+            Some(_) => {}
+            None => {
+                index_by_type.insert(native_format.as_ref().to_owned(), entries.len());
+                entries.push((native_format, representation.data.as_slice(), rank));
+            }
+        }
+    }
+    entries
+        .into_iter()
+        .map(|(format, data, _)| (format, data))
+        .collect()
+}
+
+/// Maps a known X11 selection-atom name or MIME type to the macOS UTI that
+/// carries the same bytes. Matching is case-insensitive and ignores
+/// surrounding whitespace.
+fn appkit_uti(format: &str) -> Option<&'static str> {
+    match format.trim().to_ascii_lowercase().as_str() {
+        "string"
+        | "text"
+        | "utf8_string"
+        | "text/plain"
+        | "text/plain;charset=utf-8"
+        | "public.utf8-plain-text"
+        | "nsstringpboardtype" => Some("public.utf8-plain-text"),
+        "html" | "text/html" | "text/html;charset=utf-8" | "public.html" => Some("public.html"),
+        "text/rtf" | "application/rtf" | "public.rtf" => Some("public.rtf"),
+        "image/png" | "png" | "public.png" => Some("public.png"),
+        "image/jpeg" | "image/jpg" | "jpeg" | "public.jpeg" => Some("public.jpeg"),
+        "image/tiff" | "tiff" | "public.tiff" => Some("public.tiff"),
+        "image/gif" | "gif" | "com.compuserve.gif" => Some("com.compuserve.gif"),
+        "application/pdf" | "pdf" | "com.adobe.pdf" => Some("com.adobe.pdf"),
+        _ => None,
+    }
+}
+
+/// Whether `format` already looks like a reverse-DNS Uniform Type Identifier
+/// (for example `public.rtfd` or `com.apple.webarchive`) and is safe to hand
+/// to `NSPasteboard` unchanged.
+fn is_uti_like(format: &str) -> bool {
+    !format.is_empty()
+        && !format.contains('/')
+        && !format.contains(';')
+        && !format.chars().any(char::is_whitespace)
+        && format
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        && format.contains('.')
+        && format.split('.').all(|segment| !segment.is_empty())
 }
 
 fn add_portable_aliases(representations: &mut Vec<Representation>, mut remaining: u64) {
@@ -540,5 +674,231 @@ mod tests {
             data: b"same".to_vec(),
         }]);
         assert_ne!(first.fingerprint, second.fingerprint);
+    }
+
+    #[test]
+    fn appkit_maps_x11_and_mime_text_names_to_one_uti() {
+        for name in [
+            "STRING",
+            "TEXT",
+            "UTF8_STRING",
+            "text/plain",
+            "text/plain;charset=utf-8",
+        ] {
+            assert_eq!(
+                publish_format(name, PublishTarget::AppKit).as_deref(),
+                Some("public.utf8-plain-text"),
+                "{name} should map to public.utf8-plain-text"
+            );
+        }
+    }
+
+    #[test]
+    fn appkit_maps_known_rich_and_image_mime_types() {
+        for (name, uti) in [
+            ("text/html", "public.html"),
+            ("HTML", "public.html"),
+            ("text/rtf", "public.rtf"),
+            ("application/rtf", "public.rtf"),
+            ("image/png", "public.png"),
+            ("PNG", "public.png"),
+            ("image/jpeg", "public.jpeg"),
+            ("image/tiff", "public.tiff"),
+            ("TIFF", "public.tiff"),
+            ("image/gif", "com.compuserve.gif"),
+            ("application/pdf", "com.adobe.pdf"),
+        ] {
+            assert_eq!(
+                publish_format(name, PublishTarget::AppKit).as_deref(),
+                Some(uti),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn appkit_passes_through_reverse_dns_utis_and_drops_the_rest() {
+        assert_eq!(
+            publish_format("com.apple.webarchive", PublishTarget::AppKit).as_deref(),
+            Some("com.apple.webarchive")
+        );
+        assert_eq!(
+            publish_format("public.utf8-plain-text", PublishTarget::AppKit).as_deref(),
+            Some("public.utf8-plain-text")
+        );
+        assert_eq!(
+            publish_format("public.plain-text", PublishTarget::AppKit).as_deref(),
+            Some("public.plain-text")
+        );
+        assert_eq!(
+            publish_format("public.text", PublishTarget::AppKit).as_deref(),
+            Some("public.text")
+        );
+        for dropped in ["TARGETS", "MULTIPLE", "x-special/nautilus-clipboard", ""] {
+            assert_eq!(
+                publish_format(dropped, PublishTarget::AppKit),
+                None,
+                "{dropped:?} should be dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn is_uti_like_accepts_reverse_dns_and_rejects_malformed_names() {
+        assert!(is_uti_like("dyn.ah62d4rv4ge80s5dbq"));
+        assert!(is_uti_like("com.apple.flat-rtfd"));
+        assert!(!is_uti_like("foo."));
+        assert!(!is_uti_like(".foo"));
+        assert!(!is_uti_like("my.type!"));
+    }
+
+    #[test]
+    fn passthrough_target_preserves_every_name_verbatim() {
+        for name in [
+            "STRING",
+            "text/plain",
+            "x-special/gnome-copied-files",
+            "public.png",
+            "TARGETS",
+        ] {
+            assert_eq!(
+                publish_format(name, PublishTarget::Passthrough).as_deref(),
+                Some(name)
+            );
+        }
+    }
+
+    #[test]
+    fn generic_entries_collapse_duplicate_text_flavors_for_appkit() {
+        let representations = vec![
+            Representation {
+                item: 0,
+                format: "STRING".into(),
+                data: b"latin1-bytes".to_vec(),
+            },
+            Representation {
+                item: 0,
+                format: "UTF8_STRING".into(),
+                data: b"utf8-bytes".to_vec(),
+            },
+            Representation {
+                item: 0,
+                format: "text/plain".into(),
+                data: b"utf8-bytes".to_vec(),
+            },
+        ];
+        let entries = generic_publish_entries(&representations, PublishTarget::AppKit, false);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0.as_ref(), "public.utf8-plain-text");
+        assert_eq!(
+            entries[0].1, b"utf8-bytes",
+            "the UTF-8 source's bytes must win over STRING"
+        );
+    }
+
+    #[test]
+    fn source_rank_prefers_utf8_text_over_legacy_atoms() {
+        assert!(source_rank("UTF8_STRING") > source_rank("STRING"));
+        assert!(source_rank("text/plain;charset=utf-8") > source_rank("TEXT"));
+        assert!(source_rank("public.utf8-plain-text") > source_rank("UTF8_STRING"));
+        assert!(source_rank("text/plain") > source_rank("STRING"));
+        assert!(source_rank("TEXT") > source_rank("STRING"));
+    }
+
+    #[test]
+    fn passthrough_keeps_uri_list_when_no_files_were_published() {
+        let representations = vec![Representation {
+            item: 0,
+            format: "text/uri-list".into(),
+            data: b"https://example.com/\r\n".to_vec(),
+        }];
+        let with = generic_publish_entries(&representations, PublishTarget::Passthrough, true);
+        assert!(
+            with.is_empty(),
+            "when Files was published, the raw uri-list is suppressed"
+        );
+        let without = generic_publish_entries(&representations, PublishTarget::Passthrough, false);
+        assert_eq!(without.len(), 1);
+        assert_eq!(without[0].0.as_ref(), "text/uri-list");
+        assert_eq!(without[0].1, b"https://example.com/\r\n");
+    }
+
+    #[test]
+    fn generic_entries_skip_markers_files_and_unmappable_names_for_appkit() {
+        let representations = vec![
+            Representation {
+                item: 0,
+                format: "text/uri-list".into(),
+                data: b"file:///tmp/x".to_vec(),
+            },
+            Representation {
+                item: 0,
+                format: "org.nspasteboard.TransientType".into(),
+                data: b"1".to_vec(),
+            },
+            Representation {
+                item: 0,
+                format: "org.nspasteboard.ConcealedType".into(),
+                data: b"secret".to_vec(),
+            },
+            Representation {
+                item: 0,
+                format: "TARGETS".into(),
+                data: b"x".to_vec(),
+            },
+            Representation {
+                item: 0,
+                format: "  ".into(),
+                data: b"x".to_vec(),
+            },
+        ];
+        assert!(generic_publish_entries(&representations, PublishTarget::AppKit, true).is_empty());
+    }
+
+    #[test]
+    fn generic_entries_keep_distinct_appkit_types_in_order() {
+        let representations = vec![
+            Representation {
+                item: 0,
+                format: "text/html".into(),
+                data: b"<p>hi</p>".to_vec(),
+            },
+            Representation {
+                item: 0,
+                format: "STRING".into(),
+                data: b"hi".to_vec(),
+            },
+        ];
+        let entries = generic_publish_entries(&representations, PublishTarget::AppKit, false);
+        assert_eq!(
+            entries.iter().map(|(f, _)| f.as_ref()).collect::<Vec<_>>(),
+            vec!["public.html", "public.utf8-plain-text"]
+        );
+    }
+
+    #[test]
+    fn generic_entries_preserve_all_names_on_passthrough() {
+        let representations = vec![
+            Representation {
+                item: 0,
+                format: "STRING".into(),
+                data: b"a".to_vec(),
+            },
+            Representation {
+                item: 0,
+                format: "text/plain".into(),
+                data: b"a".to_vec(),
+            },
+            Representation {
+                item: 0,
+                format: "x-special/gnome-copied-files".into(),
+                data: b"a".to_vec(),
+            },
+        ];
+        let entries = generic_publish_entries(&representations, PublishTarget::Passthrough, false);
+        assert_eq!(
+            entries.iter().map(|(f, _)| f.as_ref()).collect::<Vec<_>>(),
+            vec!["STRING", "text/plain", "x-special/gnome-copied-files"]
+        );
     }
 }
