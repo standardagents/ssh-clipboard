@@ -43,6 +43,7 @@ objc2-foundation = { version = "0.3.2", features = ["NSArray", "NSData", "NSStri
 
 [target.'cfg(target_os = "linux")'.dependencies]
 clipboard-rs = { version = "0.3.5", default-features = false, features = ["wayland"] }
+x11rb = "0.13.2"
 
 [dev-dependencies]
 pretty_assertions = "1.4.1"

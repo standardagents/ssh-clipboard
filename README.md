@@ -42,14 +42,19 @@ The manual update command also reconciles the per-user service, so it can recove
 
 ### Copying files
 
-Copy files or folders in Finder, wait for the transfer to finish in `ssh-clipboard monitor`,
-then paste into a Finder folder on the other Mac. Transfers are extension-independent:
+Copy files or folders in Finder or a Linux file manager, wait for the transfer to finish
+in `ssh-clipboard monitor`, then paste into a folder on the other machine. Transfers work
+in both directions and are extension-independent:
 PDFs, DMGs, PKGs, images, documents, and unknown file types all use the same byte-transfer
 path. Folders, empty directories, executable permissions, and symbolic links are preserved.
 Copying does not install or execute anything, and does not delete the source.
 
 On Linux, a running graphical clipboard (X11 or supported Wayland session) is required.
-The receiver publishes local file URLs with GNOME/Nautilus and KDE copy formats;
+The receiver publishes local file URLs with the shared URI-list, GNOME/Nautilus (also
+used by Thunar), and KDE copy formats. X11 transfers use incremental delivery for large
+clipboard representations, inside the existing daemon; no sidecar is required.
+Live Thunar transfers and independent GTK protocol tests cover both directions;
+this is shared-format support, not a claim that every file-manager version was UI-tested.
 macOS applications and installers remain files, not Linux-compatible applications.
 macOS-only metadata such as resource forks and extended attributes is not currently
 preserved. Both peers must run the current version for symbolic-link transfers.

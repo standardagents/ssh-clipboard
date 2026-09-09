@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
@@ -24,7 +25,7 @@ fn headless_x11_round_trip() {
     if std::env::var_os(CHILD_MARKER).is_some() {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
-            let clipboard = NativeClipboard::new(1024 * 1024).unwrap();
+            let clipboard = NativeClipboard::new(128 * 1024 * 1024).unwrap();
             assert_eq!(clipboard.name(), "X11");
             clipboard
                 .apply(&[Representation {
@@ -41,6 +42,34 @@ fn headless_x11_round_trip() {
                     .iter()
                     .any(|representation| { representation.data == b"headless clipboard smoke test" })
             );
+            // Larger than Xorg's BIG-REQUESTS limit as well as its core request
+            // limit. Serving this must use INCR, then remain available for files.
+            let large = vec![Representation {
+                item: 0,
+                format: "application/x-ssh-clipboard-large-test".into(),
+                data: (0_u8..=250).cycle().take(32 * 1024 * 1024).collect(),
+            }];
+            clipboard.apply(&large).await.unwrap();
+            let snapshot = clipboard.capture().await.unwrap().unwrap();
+            assert_eq!(snapshot.representations, large);
+            gtk_read(&large[0]);
+            // GTK owns and serves the reverse large transfer, independently of
+            // our X11 writer and with its own INCR implementation.
+            let fixture = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(fixture.path(), &large[0].data).unwrap();
+            let mut gtk = Xvfb(
+                gtk_command("write", &large[0].format, fixture.path())
+                    .stdout(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut ready = String::new();
+            BufReader::new(gtk.0.stdout.take().unwrap())
+                .read_line(&mut ready)
+                .unwrap();
+            assert_eq!(ready.trim(), "READY");
+            assert_eq!(clipboard.capture().await.unwrap().unwrap().representations, large);
+            drop(gtk);
             // Exercise the real X11 owner, not just a MIME serialization unit
             // test. Finder bundles must become local, encoded file references.
             let source = tempfile::tempdir().unwrap();
@@ -86,6 +115,61 @@ fn headless_x11_round_trip() {
                 .unwrap();
             assert!(gnome.data.starts_with(b"copy\nfile://"));
             assert!(String::from_utf8_lossy(&uri_list.data).contains("Manual%20%231.pdf"));
+            for representation in &captured.representations {
+                if matches!(
+                    representation.format.as_str(),
+                    "text/uri-list"
+                        | "x-special/gnome-copied-files"
+                        | "x-special/nautilus-clipboard"
+                        | "application/x-kde-cutselection"
+                ) {
+                    gtk_read(representation);
+                }
+            }
+            // Some file managers offer only URI lists; others offer GNOME's
+            // action-prefixed selection. Each must independently produce bytes
+            // that can be materialized on a different machine, not just names.
+            for format in [
+                "text/uri-list",
+                "x-special/gnome-copied-files",
+                "x-special/nautilus-clipboard",
+            ] {
+                let representation = captured
+                    .representations
+                    .iter()
+                    .find(|r| r.format == format)
+                    .unwrap();
+                let fixture = tempfile::NamedTempFile::new().unwrap();
+                std::fs::write(fixture.path(), &representation.data).unwrap();
+                let mut gtk = Xvfb(
+                    gtk_command("write", format, fixture.path())
+                        .stdout(Stdio::piped())
+                        .spawn()
+                        .unwrap(),
+                );
+                let mut ready = String::new();
+                BufReader::new(gtk.0.stdout.take().unwrap())
+                    .read_line(&mut ready)
+                    .unwrap();
+                assert_eq!(ready.trim(), "READY");
+                let snapshot = clipboard.capture().await.unwrap().unwrap();
+                assert!(
+                    snapshot
+                        .representations
+                        .iter()
+                        .any(|r| r.format == ssh_clipboard::filebundle::BUNDLE_FORMAT)
+                );
+                let received =
+                    ssh_clipboard::filebundle::materialize(uuid::Uuid::new_v4(), &snapshot.representations)
+                        .unwrap();
+                let uris = received.iter().find(|r| r.format == "text/uri-list").unwrap();
+                let files = ssh_clipboard::filebundle::parse_uri_list(&uris.data);
+                assert_eq!(files.len(), paths.len());
+                for file in files {
+                    assert_eq!(std::fs::read(file).unwrap(), [0, 1, 2, 255]);
+                }
+                drop(gtk);
+            }
         });
         return;
     }
@@ -108,7 +192,7 @@ fn headless_x11_round_trip() {
             .expect("CI installs Xvfb before running this test"),
     );
     for _ in 0..50 {
-        if Path::new("/tmp/.X11-unix/X97").exists() {
+        if x11rb::connect(Some(DISPLAY)).is_ok() {
             break;
         }
         if let Some(status) = xvfb.0.try_wait().unwrap() {
@@ -131,4 +215,29 @@ fn headless_x11_round_trip() {
         .status()
         .unwrap();
     assert!(status.success());
+}
+
+fn gtk_command(mode: &str, format: &str, path: &Path) -> Command {
+    let mut command = Command::new("timeout");
+    command.args([
+        "15",
+        "python3",
+        "-c",
+        include_str!("fixtures/gtk_clipboard.py"),
+        mode,
+        format,
+    ]);
+    command.arg(path);
+    command
+}
+
+fn gtk_read(representation: &Representation) {
+    let fixture = tempfile::NamedTempFile::new().unwrap();
+    std::fs::write(fixture.path(), &representation.data).unwrap();
+    assert!(
+        gtk_command("read", &representation.format, fixture.path())
+            .status()
+            .unwrap()
+            .success()
+    );
 }

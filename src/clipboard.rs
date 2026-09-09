@@ -18,6 +18,11 @@ pub(crate) mod macos;
 #[cfg(any(target_os = "linux", test))]
 mod linux_files;
 
+#[cfg(target_os = "linux")]
+mod x11_owner;
+#[cfg(target_os = "linux")]
+mod x11_read;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
     pub representations: Vec<Representation>,
@@ -55,6 +60,8 @@ pub trait ClipboardBackend: Send + Sync {
 #[derive(Clone)]
 pub struct NativeClipboard {
     context: Arc<Mutex<clipboard_rs::ClipboardContext>>,
+    #[cfg(target_os = "linux")]
+    x11_owner: Option<Arc<x11_owner::Owner>>,
     max_bytes: u64,
 }
 
@@ -74,8 +81,16 @@ impl NativeClipboard {
         use clipboard_rs::ClipboardContext;
         let context = ClipboardContext::new()
             .map_err(|error| anyhow::anyhow!("initialize native clipboard: {error}"))?;
+        #[cfg(target_os = "linux")]
+        let x11_owner = if matches!(&context, ClipboardContext::X11(_)) {
+            Some(Arc::new(x11_owner::Owner::new()?))
+        } else {
+            None
+        };
         Ok(Self {
             context: Arc::new(Mutex::new(context)),
+            #[cfg(target_os = "linux")]
+            x11_owner,
             max_bytes,
         })
     }
@@ -139,7 +154,17 @@ impl NativeClipboard {
             if format.trim().is_empty() || is_internal_marker(&format) {
                 continue;
             }
-            let Ok(data) = context.get_buffer(&format) else {
+            #[cfg(target_os = "linux")]
+            let buffer = if self.x11_owner.is_some() {
+                x11_read::read(&format, self.max_bytes.saturating_sub(total))
+            } else {
+                context
+                    .get_buffer(&format)
+                    .map_err(|error| anyhow::anyhow!("{error}"))
+            };
+            #[cfg(target_os = "macos")]
+            let buffer = context.get_buffer(&format);
+            let Ok(data) = buffer else {
                 continue;
             };
             total = total
@@ -256,7 +281,14 @@ impl NativeClipboard {
         let native_files = clipboard_file_paths(representations);
         #[cfg(target_os = "linux")]
         if !native_files.is_empty() {
-            let contents = linux_files::representations(&native_files)
+            let representations = linux_files::representations(&native_files);
+            if let Some(owner) = &self.x11_owner {
+                owner.publish(representations)?;
+                return self
+                    .capture_sync()?
+                    .context("native file clipboard was empty after publishing");
+            }
+            let contents = representations
                 .into_iter()
                 .map(|representation| ClipboardContent::Other(representation.format, representation.data))
                 .collect();
@@ -305,6 +337,23 @@ impl NativeClipboard {
         }
         if contents.is_empty() {
             bail!("clipboard payload has no safe representations");
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = &self.x11_owner {
+            owner.publish(
+                representations
+                    .iter()
+                    .filter(|r| {
+                        !r.format.trim().is_empty()
+                            && !is_internal_marker(&r.format)
+                            && !is_sensitive_marker(&r.format)
+                    })
+                    .cloned()
+                    .collect(),
+            )?;
+            return self
+                .capture_sync()?
+                .context("native clipboard was empty immediately after publishing");
         }
         let context = self
             .context
