@@ -90,6 +90,17 @@ fn configured_peer_names(config: &Config) -> Vec<String> {
     names
 }
 
+pub(super) fn merge_peer(peers: &mut Vec<PeerConfig>, configured: PeerConfig) {
+    if let Some(existing) = peers
+        .iter_mut()
+        .find(|existing| existing.ssh_command == configured.ssh_command || existing.name == configured.name)
+    {
+        *existing = configured;
+    } else {
+        peers.push(configured);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -107,16 +118,5 @@ mod tests {
             ..Config::default()
         };
         assert_eq!(configured_peer_names(&config), ["a-linux", "z-mac"]);
-    }
-}
-
-pub(super) fn merge_peer(peers: &mut Vec<PeerConfig>, configured: PeerConfig) {
-    if let Some(existing) = peers
-        .iter_mut()
-        .find(|existing| existing.ssh_command == configured.ssh_command || existing.name == configured.name)
-    {
-        *existing = configured;
-    } else {
-        peers.push(configured);
     }
 }
