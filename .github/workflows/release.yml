@@ -80,7 +80,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev
+        run: sudo bash .github/scripts/install-linux-build-deps.sh libwayland-dev
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release --locked
