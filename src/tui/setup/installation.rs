@@ -1,9 +1,11 @@
 use std::sync::mpsc::Sender;
+use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::config::{Config, PeerConfig};
 use crate::deploy;
+use crate::{daemon, service};
 
 use super::{UiMessage, VerifiedPeer};
 
@@ -12,6 +14,12 @@ pub(super) async fn install_all(
     peers: Vec<VerifiedPeer>,
     sender: Sender<UiMessage>,
 ) -> Result<()> {
+    // A healthy daemon may still be running the configuration from before setup.
+    // Remember it before saving so adding/replacing peers takes effect immediately.
+    let was_running = matches!(
+        tokio::time::timeout(Duration::from_secs(2), daemon::query_status()).await,
+        Ok(Ok(_))
+    );
     let mut local = config;
     for peer in &peers {
         merge_peer(
@@ -49,12 +57,29 @@ pub(super) async fn install_all(
         complete: false,
     });
     let outcome = deploy::install_local_service().await?;
+    if was_running && outcome == service::InstallOutcome::Running {
+        service::control(service::Action::Restart).await?;
+        wait_for_configured_peers(&local).await?;
+    }
     let _ = sender.send(UiMessage::Progress {
         peer: local.node_name,
         detail: outcome.detail().into(),
         complete: true,
     });
     Ok(())
+}
+
+async fn wait_for_configured_peers(config: &Config) -> Result<()> {
+    let expected: Vec<_> = config.peers.iter().map(|peer| peer.name.clone()).collect();
+    for _ in 0..100 {
+        if let Ok(Ok(status)) = tokio::time::timeout(Duration::from_secs(1), daemon::query_status()).await
+            && status.configured_peers == expected
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    bail!("service did not load the saved peers after restart; inspect the daemon log")
 }
 
 pub(super) fn merge_peer(peers: &mut Vec<PeerConfig>, configured: PeerConfig) {
