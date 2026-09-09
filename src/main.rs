@@ -52,6 +52,8 @@ enum Command {
     #[command(hide = true)]
     Daemon,
     #[command(hide = true)]
+    ServiceSupervisor,
+    #[command(hide = true)]
     Bridge,
     #[command(hide = true)]
     UpdateWatchdog { version: String },
@@ -197,6 +199,7 @@ async fn run() -> Result<()> {
             ServiceAction::Restart => service::control(service::Action::Restart).await,
         },
         Some(Command::Daemon) => {
+            service::container::prepare_daemon()?;
             tracing_subscriber::fmt()
                 .with_env_filter(
                     tracing_subscriber::EnvFilter::try_from_default_env()
@@ -207,6 +210,7 @@ async fn run() -> Result<()> {
             daemon::run(Config::load()?).await
         }
         Some(Command::Bridge) => daemon::bridge().await,
+        Some(Command::ServiceSupervisor) => service::container::supervise().await,
         Some(Command::UpdateWatchdog { version }) => update::watchdog(&version).await,
     }
 }

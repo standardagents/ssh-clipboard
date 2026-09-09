@@ -71,6 +71,24 @@ without you. Once selected, the per-user service runs against private display `:
 preserve that choice. See the [headless Linux guide](docs/headless-linux.md) for guided and manual
 setup, lingering, and troubleshooting.
 
+### Linux desktop containers
+
+Without systemd, the same `ssh-clipboard` executable supervises the daemon and restarts
+it after crashes or updates. No separate supervisor package is needed. Run
+`ssh-clipboard service install --native-display` **in the container's desktop terminal**
+to select that desktop; its display environment is saved for subsequent SSH sessions
+and updates. A private `--headless-x11` display does not share an existing VNC desktop's
+clipboard. When installing over SSH, explicitly supply that desktop's `DISPLAY` and,
+if needed, `XAUTHORITY` (or its Wayland environment).
+
+Only one side needs to initiate SSH; an established connection carries clipboard data
+in both directions. Add the container as a peer on the Mac that can SSH into it.
+`service start`, `service stop`, `service restart`, and the normal monitor still work.
+After a container restart, an incoming SSH clipboard connection revives an enabled
+service. Without an incoming connection, invoke `ssh-clipboard service start` from the
+container's startup hook. An explicit stop disables automatic revival. Recreating a
+container requires retaining its binary, configuration, and state directories or reinstalling.
+
 The monitor shows each machine on its own row with installed and target versions. Press `u` to queue an immediate npm check and notify every connected client that supports update events.
 
 Every installed daemon independently checks the stable npm release at startup and every 15 minutes, and gossips its verified desired version to connected peers. Any online machine can therefore trigger convergence; there is no permanent update coordinator. Packages are accepted only after npm SHA-512 integrity, the bundled SHA-256 manifest, executable target, and reported binary version all agree. Updates retain the previous executable, replace the live binary atomically, and explicitly ask launchd/systemd to restart the daemon.

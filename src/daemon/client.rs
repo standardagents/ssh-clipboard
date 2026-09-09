@@ -7,6 +7,9 @@ use crate::config::paths;
 use super::{Status, UpdateNotification};
 
 pub async fn bridge() -> Result<()> {
+    if cfg!(target_os = "linux") {
+        crate::service::container::ensure_started().await?;
+    }
     let socket = paths()?.socket;
     let mut stream = UnixStream::connect(&socket)
         .await

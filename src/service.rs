@@ -9,6 +9,8 @@ use tokio::process::Command;
 
 use crate::config::{ensure_private_dir, paths};
 
+pub mod container;
+
 const LABEL: &str = "dev.ssh-clipboard";
 const MANAGED_MARKER: &str = "# Managed by ssh-clipboard; use the CLI instead of editing this file.";
 
@@ -67,6 +69,11 @@ pub async fn install(binary: &Path, options: InstallOptions) -> Result<InstallOu
         tokio::fs::create_dir_all(parent).await?;
     }
     ensure_private_dir(&paths.state_dir)?;
+    if cfg!(target_os = "linux") && (container::installed()? || container::required().await) {
+        container::install(binary, options).await?;
+        wait_until_healthy(&paths.socket, &expected_version).await?;
+        return Ok(InstallOutcome::Running);
+    }
     if options.headless_x11 && !cfg!(target_os = "linux") {
         bail!("managed Xvfb is supported only on Linux");
     }
@@ -121,6 +128,9 @@ pub async fn control(action: Action) -> Result<()> {
             Action::Restart => run("launchctl", &["kickstart", "-k", &format!("{domain}/{LABEL}")]).await,
         }
     } else if cfg!(target_os = "linux") {
+        if container::installed()? {
+            return container::control(action).await;
+        }
         let action = match action {
             Action::Start => "start",
             Action::Stop => "stop",
