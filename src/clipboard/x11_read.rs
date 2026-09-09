@@ -28,6 +28,15 @@ pub(super) fn read(format: &str, max_bytes: u64) -> Result<Vec<u8>> {
     let selection = conn.intern_atom(false, b"CLIPBOARD")?.reply()?.atom;
     let property = conn.intern_atom(false, b"SSH_CLIPBOARD_READ")?.reply()?.atom;
     let incr = conn.intern_atom(false, b"INCR")?.reply()?.atom;
+    if conn.get_selection_owner(selection)?.reply()?.owner == NONE {
+        return Ok(Vec::new());
+    }
+    let expected_type = if format == "TARGETS" {
+        AtomEnum::ATOM.into()
+    } else {
+        target
+    };
+    let expected_bits = if format == "TARGETS" { 32 } else { 8 };
     conn.convert_selection(window, selection, target, property, CURRENT_TIME)?
         .check()?;
     conn.flush()?;
@@ -82,7 +91,7 @@ pub(super) fn read(format: &str, max_bytes: u64) -> Result<Vec<u8>> {
             continue;
         }
         ensure!(
-            reply.type_ == target && reply.format == 8,
+            reply.type_ == expected_type && reply.format == expected_bits,
             "X11 clipboard data type mismatch"
         );
         if reply.bytes_after != 0 || reply.value.len() as u64 > remaining {
@@ -96,4 +105,23 @@ pub(super) fn read(format: &str, max_bytes: u64) -> Result<Vec<u8>> {
         progress = Instant::now();
         conn.flush()?;
     }
+}
+
+pub(super) fn formats() -> Result<Vec<String>> {
+    // Bound TARGETS separately; format metadata should never consume the user's
+    // entire clipboard-size allowance. Use the same progress-aware reader.
+    let bytes = read("TARGETS", 1024 * 1024)?;
+    let (conn, _) = x11rb::connect(None)?;
+    let mut formats = Vec::new();
+    for atom in bytes.chunks_exact(4) {
+        let atom = u32::from_ne_bytes(atom.try_into()?);
+        let name = String::from_utf8(conn.get_atom_name(atom)?.reply()?.name)?;
+        if !matches!(
+            name.as_str(),
+            "TARGETS" | "MULTIPLE" | "TIMESTAMP" | "SAVE_TARGETS"
+        ) {
+            formats.push(name);
+        }
+    }
+    Ok(formats)
 }

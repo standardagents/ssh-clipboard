@@ -55,6 +55,10 @@ used by Thunar), and KDE copy formats. X11 transfers use incremental delivery fo
 clipboard representations, inside the existing daemon; no sidecar is required.
 Live Thunar transfers and independent GTK protocol tests cover both directions;
 this is shared-format support, not a claim that every file-manager version was UI-tested.
+Raw image clipboards (for example, screenshots copied without saving a file) also
+offer a cached image file on Linux. PNG is preferred when available; the original
+image representations remain available for pasting into image editors. Identical
+image bytes reuse the same private cache file instead of creating repeated copies.
 macOS applications and installers remain files, not Linux-compatible applications.
 macOS-only metadata such as resource forks and extended attributes is not currently
 preserved. Both peers must run the current version for symbolic-link transfers.

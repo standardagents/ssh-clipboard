@@ -131,7 +131,11 @@ impl Daemon {
     async fn watch_clipboard(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         let mut retry = capture_retry::CaptureRetry::default();
         let mut previous = match self.clipboard.capture().await {
-            Ok(snapshot) => snapshot,
+            Ok(Some(snapshot)) => Some(snapshot),
+            Ok(None) => {
+                retry.failed();
+                None
+            }
             Err(error) => {
                 warn!(error = %format!("{error:#}"), "initial clipboard capture failed");
                 retry.failed();
@@ -148,7 +152,10 @@ impl Daemon {
                     let _guard = self.apply_lock.lock().await;
                     let snapshot = match self.clipboard.capture().await {
                         Ok(Some(snapshot)) => { retry.reset(); snapshot },
-                        Ok(None) => { retry.reset(); continue; },
+                        // Clipboard ownership/change notification may precede
+                        // the provider publishing its image or file data. An
+                        // empty first read needs a bounded retry too.
+                        Ok(None) => { retry.failed(); continue; },
                         Err(error) => {
                             warn!(error = %format!("{error:#}"), "clipboard capture failed");
                             retry.failed();

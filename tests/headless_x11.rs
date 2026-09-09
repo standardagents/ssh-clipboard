@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 
+use base64::Engine as _;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -70,6 +71,45 @@ fn headless_x11_round_trip() {
             assert_eq!(ready.trim(), "READY");
             assert_eq!(clipboard.capture().await.unwrap().unwrap().representations, large);
             drop(gtk);
+            // Screenshot pixels are not a Finder file selection. They must be
+            // offered as both image data and a local file, without echoing the
+            // synthetic file/bundle back through the mesh on capture.
+            let png = base64::engine::general_purpose::STANDARD.decode(
+                "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aD1sAAAAASUVORK5CYII="
+            ).unwrap();
+            let pixels = vec![Representation {
+                item: 0,
+                format: "image/png".into(),
+                data: png.clone(),
+            }];
+            let applied = clipboard.apply(&pixels).await.unwrap();
+            gtk_read(&pixels[0]);
+            assert!(
+                !applied
+                    .representations
+                    .iter()
+                    .any(|r| r.format.contains("file") || r.format == "text/uri-list")
+            );
+            assert_eq!(applied, clipboard.capture().await.unwrap().unwrap());
+            assert_eq!(applied, clipboard.apply(&pixels).await.unwrap());
+            let cache = ssh_clipboard::config::paths().unwrap().state_dir.join("images");
+            let cached = std::fs::read_dir(cache)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            assert_eq!(cached.len(), 1);
+            assert_eq!(std::fs::read(&cached[0]).unwrap(), png);
+            let uri = ssh_clipboard::filebundle::path_to_uri(&cached[0]);
+            gtk_read(&Representation {
+                item: 0,
+                format: "text/uri-list".into(),
+                data: uri.as_bytes().to_vec(),
+            });
+            gtk_read(&Representation {
+                item: 0,
+                format: "x-special/gnome-copied-files".into(),
+                data: format!("copy\n{uri}").into_bytes(),
+            });
             // Exercise the real X11 owner, not just a MIME serialization unit
             // test. Finder bundles must become local, encoded file references.
             let source = tempfile::tempdir().unwrap();
