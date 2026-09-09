@@ -209,7 +209,19 @@ async fn run() -> Result<()> {
                 .init();
             daemon::run(Config::load()?).await
         }
-        Some(Command::Bridge) => daemon::bridge().await,
+        Some(Command::Bridge) => {
+            // Tokio stdin uses an uncancellable blocking read. Returning through
+            // #[tokio::main] can keep an idle SSH bridge alive after its daemon
+            // disconnects. This dedicated pipe process must close SSH promptly.
+            let code = match daemon::bridge().await {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("ssh-clipboard: {error:#}");
+                    1
+                }
+            };
+            std::process::exit(code);
+        }
         Some(Command::ServiceSupervisor) => service::container::supervise().await,
         Some(Command::UpdateWatchdog { version }) => update::watchdog(&version).await,
     }
