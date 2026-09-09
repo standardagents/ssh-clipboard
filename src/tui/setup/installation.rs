@@ -70,7 +70,7 @@ pub(super) async fn install_all(
 }
 
 async fn wait_for_configured_peers(config: &Config) -> Result<()> {
-    let expected: Vec<_> = config.peers.iter().map(|peer| peer.name.clone()).collect();
+    let expected = configured_peer_names(config);
     for _ in 0..100 {
         if let Ok(Ok(status)) = tokio::time::timeout(Duration::from_secs(1), daemon::query_status()).await
             && status.configured_peers == expected
@@ -80,6 +80,34 @@ async fn wait_for_configured_peers(config: &Config) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     bail!("service did not load the saved peers after restart; inspect the daemon log")
+}
+
+fn configured_peer_names(config: &Config) -> Vec<String> {
+    // Status returns sorted, unique names, not configuration insertion order.
+    let mut names: Vec<_> = config.peers.iter().map(|peer| peer.name.clone()).collect();
+    names.sort();
+    names.dedup();
+    names
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn setup_readiness_uses_status_order_for_multiple_peers() {
+        let config = Config {
+            peers: ["z-mac", "a-linux", "z-mac"]
+                .into_iter()
+                .map(|name| PeerConfig {
+                    name: name.into(),
+                    ssh_command: format!("ssh {name}"),
+                })
+                .collect(),
+            ..Config::default()
+        };
+        assert_eq!(configured_peer_names(&config), ["a-linux", "z-mac"]);
+    }
 }
 
 pub(super) fn merge_peer(peers: &mut Vec<PeerConfig>, configured: PeerConfig) {
