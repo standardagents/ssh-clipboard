@@ -460,39 +460,54 @@ fn clipboard_file_paths(representations: &[Representation]) -> Vec<String> {
 fn add_portable_aliases(representations: &mut Vec<Representation>, mut remaining: u64) {
     let originals = representations.clone();
     for representation in originals {
-        let alias = match representation.format.as_str() {
-            "public.utf8-plain-text" | "public.plain-text" | "NSStringPboardType" | "UTF8_STRING" => {
-                "text/plain;charset=utf-8"
+        let aliases: &[&str] = match representation.format.as_str() {
+            "public.utf8-plain-text" | "public.plain-text" | "NSStringPboardType" => {
+                &["text/plain;charset=utf-8"]
             }
-            "public.html" => "text/html",
-            "public.rtf" => "text/rtf",
-            "public.png" => "image/png",
-            "public.jpeg" => "image/jpeg",
-            "public.tiff" => "image/tiff",
-            "com.compuserve.gif" => "image/gif",
-            "public.heic" => "image/heic",
-            "public.heif" => "image/heif",
-            "org.webmproject.webp" => "image/webp",
-            "com.adobe.pdf" => "application/pdf",
-            "public.file-url" => "text/uri-list",
+            "UTF8_STRING" => &["public.utf8-plain-text", "text/plain;charset=utf-8"],
+            "text/plain" | "text/plain;charset=utf-8" => &["public.utf8-plain-text"],
+            "public.html" => &["text/html"],
+            "text/html" => &["public.html"],
+            "public.rtf" => &["text/rtf"],
+            "text/rtf" | "application/rtf" => &["public.rtf"],
+            "public.png" => &["image/png"],
+            "image/png" => &["public.png"],
+            "public.jpeg" => &["image/jpeg"],
+            "image/jpeg" => &["public.jpeg"],
+            "public.tiff" => &["image/tiff"],
+            "image/tiff" => &["public.tiff"],
+            "com.compuserve.gif" => &["image/gif"],
+            "image/gif" => &["com.compuserve.gif"],
+            "public.heic" => &["image/heic"],
+            "image/heic" => &["public.heic"],
+            "public.heif" => &["image/heif"],
+            "image/heif" => &["public.heif"],
+            "org.webmproject.webp" => &["image/webp"],
+            "image/webp" => &["org.webmproject.webp"],
+            "com.adobe.pdf" => &["application/pdf"],
+            "application/pdf" => &["com.adobe.pdf"],
+            // A URI list may contain multiple files; it is not a single public.file-url.
+            "public.file-url" => &["text/uri-list"],
             _ => continue,
         };
-        if representations
-            .iter()
-            .any(|existing| existing.item == representation.item && existing.format == alias)
-        {
-            continue;
+        for alias in aliases {
+            if representations
+                .iter()
+                .any(|existing| existing.item == representation.item && existing.format == *alias)
+            {
+                continue;
+            }
+            let size = u64::try_from(representation.data.len()).unwrap_or(u64::MAX);
+            if size > remaining {
+                continue;
+            }
+            remaining -= size;
+            representations.push(Representation {
+                item: representation.item,
+                format: (*alias).to_owned(),
+                data: representation.data.clone(),
+            });
         }
-        let size = u64::try_from(representation.data.len()).unwrap_or(u64::MAX);
-        if size > remaining {
-            continue;
-        }
-        remaining -= size;
-        representations.push(Representation {
-            item: representation.item,
-            format: alias.to_owned(),
-            data: representation.data,
-        });
     }
 }
 
@@ -547,6 +562,57 @@ mod tests {
         assert_eq!(representations[0].format, "public.tiff");
         assert_eq!(representations[1].format, "image/tiff");
         assert_eq!(representations[0].data, representations[1].data);
+    }
+
+    #[test]
+    fn linux_formats_receive_native_mac_aliases() {
+        for (format, native) in [
+            ("UTF8_STRING", "public.utf8-plain-text"),
+            ("text/plain", "public.utf8-plain-text"),
+            ("text/plain;charset=utf-8", "public.utf8-plain-text"),
+            ("text/html", "public.html"),
+            ("image/png", "public.png"),
+            ("image/jpeg", "public.jpeg"),
+            ("application/pdf", "com.adobe.pdf"),
+        ] {
+            let original = Representation {
+                item: 2,
+                format: format.into(),
+                data: b"test".to_vec(),
+            };
+            let mut representations = vec![original.clone()];
+            add_portable_aliases(&mut representations, 8);
+            assert_eq!(representations[0], original);
+            assert!(
+                representations
+                    .iter()
+                    .any(|r| r.item == 2 && r.format == native && r.data == original.data)
+            );
+        }
+    }
+
+    #[test]
+    fn native_aliases_respect_limits_and_existing_representations() {
+        let mut representations = vec![Representation {
+            item: 0,
+            format: "UTF8_STRING".into(),
+            data: b"test".to_vec(),
+        }];
+        add_portable_aliases(&mut representations, 3);
+        assert_eq!(representations.len(), 1);
+        add_portable_aliases(&mut representations, 4);
+        assert_eq!(representations.len(), 2);
+        assert_eq!(representations[1].format, "public.utf8-plain-text");
+        representations[1].data = b"existing native text".to_vec();
+        add_portable_aliases(&mut representations, 100);
+        assert_eq!(
+            representations
+                .iter()
+                .filter(|r| r.format == "public.utf8-plain-text")
+                .count(),
+            1
+        );
+        assert_eq!(representations[1].data, b"existing native text");
     }
 
     #[test]
