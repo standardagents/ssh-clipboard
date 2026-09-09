@@ -91,8 +91,14 @@ fn publish_files_to(pasteboard: &NSPasteboard, paths: &[PathBuf]) -> Result<()> 
 mod tests {
     use super::*;
 
+    // These tests have exhibited cross-board item interference under concurrent
+    // AppKit writes, despite separately named boards. Serialize the native
+    // integration tests so another test's item cannot contaminate a read.
+    static PASTEBOARD_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn publishes_an_image_file_as_a_file_instead_of_raw_image_data() {
+        let _guard = PASTEBOARD_TEST_LOCK.lock().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("message.png");
         let png = b"\x89PNG\r\n\x1a\nfixture";
@@ -116,6 +122,7 @@ mod tests {
 
     #[test]
     fn publishes_every_file_as_a_native_pasteboard_item() {
+        let _guard = PASTEBOARD_TEST_LOCK.lock().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let first = directory.path().join("first.txt");
         let second = directory.path().join("folder");
@@ -143,6 +150,7 @@ mod tests {
 
     #[test]
     fn resolves_native_file_urls_from_the_pasteboard() {
+        let _guard = PASTEBOARD_TEST_LOCK.lock().unwrap();
         let directory = tempfile::tempdir().unwrap();
         let first = directory.path().join("first file.txt");
         let second = directory.path().join("second file.txt");
@@ -167,6 +175,7 @@ mod tests {
 
     #[test]
     fn rejects_an_unresolvable_advertised_file() {
+        let _guard = PASTEBOARD_TEST_LOCK.lock().unwrap();
         let pasteboard = NSPasteboard::pasteboardWithUniqueName();
         let item = NSPasteboardItem::new();
         assert!(item.setString_forType(
