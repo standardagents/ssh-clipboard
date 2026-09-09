@@ -113,8 +113,8 @@ pub(super) fn formats() -> Result<Vec<String>> {
     let bytes = read("TARGETS", 1024 * 1024)?;
     let (conn, _) = x11rb::connect(None)?;
     let mut formats = Vec::new();
-    for atom in bytes.chunks_exact(4) {
-        let atom = u32::from_ne_bytes(atom.try_into()?);
+    for atom in bytes.as_chunks::<4>().0 {
+        let atom = u32::from_ne_bytes(*atom);
         let name = String::from_utf8(conn.get_atom_name(atom)?.reply()?.name)?;
         if !matches!(
             name.as_str(),
