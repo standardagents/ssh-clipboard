@@ -54,25 +54,27 @@ impl Installation {
     }
 }
 
-pub fn binary_for(os: &str, arch: &str) -> Result<PathBuf> {
+pub fn validate_target(os: &str, arch: &str) -> Result<()> {
     if !matches!(os, "darwin" | "linux") || !matches!(arch, "arm64" | "amd64") {
         bail!("unsupported target {os}/{arch}");
     }
+    Ok(())
+}
+
+pub async fn binary_for(os: &str, arch: &str) -> Result<PathBuf> {
+    validate_target(os, arch)?;
     let current = std::env::current_exe()?;
     if current_target() == (os, arch) {
         return Ok(current);
     }
-    let filename = format!("ssh-clipboard-{os}-{arch}");
     let bundle_root = std::env::var_os("SSH_CLIPBOARD_BINARIES_DIR").map(PathBuf::from);
     let candidates = binary_candidates(&current, os, arch, bundle_root.as_deref());
-    candidates
-        .into_iter()
-        .find(|candidate| candidate.is_file())
-        .with_context(|| {
-            format!(
-                "this installation does not include a {os}/{arch} peer binary; use a release bundle containing {filename}"
-            )
-        })
+    if let Some(binary) = candidates.into_iter().find(|candidate| candidate.is_file()) {
+        return Ok(binary);
+    }
+    update::peer_binary(os, arch).await.with_context(|| {
+        format!("obtain v{CURRENT_VERSION} binary for {os}/{arch}; check internet access and retry")
+    })
 }
 
 fn binary_candidates(current: &Path, os: &str, arch: &str, bundle_root: Option<&Path>) -> Vec<PathBuf> {
@@ -101,7 +103,11 @@ where
     progress("inspect", "Inspecting the existing installation");
     let installation = inspect_remote(ssh_command, probe).await?;
     if installation.needs_binary() {
-        let binary = binary_for(&probe.os, &probe.arch)?;
+        progress(
+            "resolve",
+            "Locating peer binary (downloading and verifying if needed)",
+        );
+        let binary = binary_for(&probe.os, &probe.arch).await?;
         let detail = installation.version.as_ref().map_or_else(
             || format!("Installing v{CURRENT_VERSION}"),
             |version| format!("Upgrading v{version} → v{CURRENT_VERSION}"),
@@ -297,15 +303,18 @@ pub fn current_target_name() -> Result<String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn current_binary_is_selected_for_the_current_target() {
+    #[tokio::test]
+    async fn current_binary_is_selected_for_the_current_target() {
         let (os, arch) = current_target();
-        assert_eq!(binary_for(os, arch).unwrap(), std::env::current_exe().unwrap());
+        assert_eq!(
+            binary_for(os, arch).await.unwrap(),
+            std::env::current_exe().unwrap()
+        );
     }
 
-    #[test]
-    fn unsupported_targets_are_rejected() {
-        assert!(binary_for("plan9", "mips").is_err());
+    #[tokio::test]
+    async fn unsupported_targets_are_rejected() {
+        assert!(binary_for("plan9", "mips").await.is_err());
     }
 
     #[test]

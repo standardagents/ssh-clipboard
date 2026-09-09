@@ -221,7 +221,7 @@ impl SetupApp {
                     self.handle.spawn(async move {
                         let result = async {
                             let probe = ssh::probe(&command).await?;
-                            deploy::binary_for(&probe.os, &probe.arch)?;
+                            deploy::validate_target(&probe.os, &probe.arch)?;
                             let installation = deploy::inspect_remote(&command, &probe).await?;
                             Ok((probe, installation))
                         }
@@ -282,7 +282,7 @@ impl SetupApp {
                     let probe = ssh::probe(&command)
                         .await
                         .with_context(|| format!("verify {}", peer.hostname))?;
-                    deploy::binary_for(&probe.os, &probe.arch)
+                    deploy::validate_target(&probe.os, &probe.arch)
                         .with_context(|| format!("check compatibility for {}", peer.hostname))?;
                     let installation = deploy::inspect_remote(&command, &probe)
                         .await

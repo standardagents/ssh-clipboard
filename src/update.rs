@@ -21,6 +21,9 @@ use uuid::Uuid;
 use crate::config::{ensure_private_dir, paths};
 use crate::deploy;
 
+mod peer_binary;
+pub(crate) use peer_binary::peer_binary;
+
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const NPM_LATEST_URL: &str = "https://registry.npmjs.org/ssh-clipboard/latest";
 const NPM_TARBALL_PREFIX: &str = "https://registry.npmjs.org/ssh-clipboard/-/";
@@ -475,7 +478,7 @@ mod tests {
         archive.append_data(&mut header, path, bytes).unwrap();
     }
 
-    fn fake_binary(target: &str) -> Vec<u8> {
+    pub(super) fn fake_binary(target: &str) -> Vec<u8> {
         let mut bytes = vec![0; 32];
         match target {
             "darwin-arm64" => {

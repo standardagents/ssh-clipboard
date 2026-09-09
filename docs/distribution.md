@@ -13,6 +13,22 @@ The launcher maps Node's `process.platform` and `process.arch` to one executable
 
 After installation, every daemon checks npm `@latest` independently. A newer stable package is downloaded only from the canonical npm tarball URL and must pass the registry SHA-512 integrity value, the package's per-target SHA-256 manifest, native executable-header validation, and an executed version check before atomic activation. `SSH_CLIPBOARD_DISABLE_AUTO_UPDATE=1` disables this behavior for development and controlled environments; `ssh-clipboard update --check` is always read-only.
 
+## Standalone peer installation
+
+Standalone installations can add peers with a different OS or architecture without
+the npm launcher or a manually downloaded release bundle. Setup first checks the
+remote installation. If it needs a binary and none is bundled locally, setup
+downloads the npm package for its **exact running version** and verifies the npm
+SHA-512 integrity, per-target SHA-256 manifest, and executable architecture before
+uploading. Foreign binaries are never executed on the local machine.
+
+Verified peer binaries are cached privately under the state directory's
+`peer-binaries/<version>/<target>/` tree. Cache contents are checked on reuse;
+missing or corrupt entries are downloaded again. First use requires internet
+access and a published package for the running version. Already-current peers
+and valid cache entries do not require a download. Automatic updates do not need
+to retain every platform binary.
+
 ## Building a package
 
 The release workflow builds all four targets on their native GitHub-hosted runners. To reproduce the packaging step with a directory of flat release artifacts:
