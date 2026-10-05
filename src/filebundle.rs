@@ -6,7 +6,7 @@ use std::path::{Component, Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_encode};
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
+use sha2::{Digest, Sha256};
 
 use crate::config::{ensure_private_dir, paths};
 use crate::model::Representation;
@@ -87,17 +87,14 @@ pub(crate) fn attach_bundle_from_paths(
     Ok(())
 }
 
-pub fn materialize(clip_id: Uuid, representations: &[Representation]) -> Result<Vec<Representation>> {
+pub fn materialize(representations: &[Representation]) -> Result<Vec<Representation>> {
     let Some(bundle) = representations
         .iter()
         .find(|representation| representation.format == BUNDLE_FORMAT)
     else {
         return Ok(representations.to_vec());
     };
-    let directory = paths()?
-        .state_dir
-        .join("files")
-        .join(clip_id.simple().to_string());
+    let directory = bundle_directory(&paths()?.state_dir.join("files"), &bundle.data);
     let files = decode(&bundle.data, &directory)?;
     let uri_bytes = files
         .iter()
@@ -280,6 +277,13 @@ fn collect_accessible_entries(
     Ok(())
 }
 
+/// Received bundles are stored by content, like the image cache: the same files
+/// copied again reuse one directory instead of adding another full copy for
+/// every clip.
+fn bundle_directory(files: &Path, bundle: &[u8]) -> PathBuf {
+    files.join(format!("{:x}", Sha256::digest(bundle)))
+}
+
 fn decode(bytes: &[u8], destination: &Path) -> Result<Vec<PathBuf>> {
     let mut cursor = Cursor::new(bytes);
     let mut magic = [0; 5];
@@ -319,14 +323,13 @@ fn decode(bytes: &[u8], destination: &Path) -> Result<Vec<PathBuf>> {
         bail!("copied-file bundle body size does not match its manifest");
     }
     if destination.exists() {
-        let materialized = roots
-            .iter()
-            .map(|root| destination.join(root))
-            .collect::<Vec<_>>();
-        if materialized.iter().all(|path| fs::symlink_metadata(path).is_ok()) {
-            return Ok(materialized);
+        // Normally this exact bundle from an earlier clip. A pasted file may
+        // have been edited or deleted in place since, so reuse the copy only
+        // if it still matches, and rebuild it otherwise.
+        if existing_copy_matches(&manifest, &mut cursor.clone(), destination) {
+            return Ok(roots.iter().map(|root| destination.join(root)).collect());
         }
-        bail!("existing copied-file bundle is incomplete");
+        fs::remove_dir_all(destination)?;
     }
     ensure_private_dir(destination)?;
     for entry in &manifest.entries {
@@ -380,6 +383,34 @@ fn decode(bytes: &[u8], destination: &Path) -> Result<Vec<PathBuf>> {
         bail!("copied-file bundle did not materialize every root");
     }
     Ok(materialized)
+}
+
+/// Whether `destination` still holds exactly the entries `manifest` describes,
+/// with file contents read from `body` (positioned at the first file's bytes).
+fn existing_copy_matches(manifest: &Manifest, body: &mut Cursor<&[u8]>, destination: &Path) -> bool {
+    manifest.entries.iter().all(|entry| {
+        let path = destination.join(&entry.path);
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            return false;
+        };
+        match entry.kind {
+            EntryKind::Directory => metadata.is_dir(),
+            EntryKind::Symlink => {
+                metadata.file_type().is_symlink()
+                    && fs::read_link(&path).ok().as_deref() == entry.link_target.as_deref().map(Path::new)
+            }
+            EntryKind::File => {
+                let Ok(size) = usize::try_from(entry.size) else {
+                    return false;
+                };
+                let mut expected = vec![0; size];
+                metadata.is_file()
+                    && metadata.len() == entry.size
+                    && body.read_exact(&mut expected).is_ok()
+                    && fs::read(&path).is_ok_and(|actual| actual == expected)
+            }
+        }
+    })
 }
 
 fn validate_entries(manifest: &Manifest) -> Result<()> {
@@ -531,6 +562,44 @@ mod tests {
         let roots = decode(&bundle, &destination).unwrap();
         assert_eq!(fs::read(&roots[0]).unwrap(), b"one");
         assert_eq!(fs::read(roots[1].join("two.bin")).unwrap(), [0, 1, 2, 255]);
+    }
+
+    #[test]
+    fn identical_bundles_share_one_directory() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("loop.gif"), b"GIF89a").unwrap();
+        fs::write(source.path().join("other.gif"), b"GIF87a").unwrap();
+        let first = encode(&[source.path().join("loop.gif")], 1024).unwrap();
+        let again = encode(&[source.path().join("loop.gif")], 1024).unwrap();
+        let other = encode(&[source.path().join("other.gif")], 1024).unwrap();
+        let files = Path::new("/state/files");
+        assert_eq!(bundle_directory(files, &first), bundle_directory(files, &again));
+        assert_ne!(bundle_directory(files, &first), bundle_directory(files, &other));
+    }
+
+    #[test]
+    fn reuses_an_intact_copy_and_rebuilds_a_changed_one() {
+        let source = tempfile::tempdir().unwrap();
+        fs::write(source.path().join("one.txt"), b"one").unwrap();
+        fs::create_dir(source.path().join("folder")).unwrap();
+        fs::write(source.path().join("folder/two.txt"), b"two").unwrap();
+        let bundle = encode(
+            &[source.path().join("one.txt"), source.path().join("folder")],
+            1024,
+        )
+        .unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let destination = target.path().join("received");
+        let roots = decode(&bundle, &destination).unwrap();
+        assert_eq!(decode(&bundle, &destination).unwrap(), roots);
+
+        // Edited in place after a paste: same length, different bytes.
+        fs::write(&roots[0], b"ONE").unwrap();
+        // ...and a nested file deleted, which used to fail as "incomplete".
+        fs::remove_file(roots[1].join("two.txt")).unwrap();
+        let rebuilt = decode(&bundle, &destination).unwrap();
+        assert_eq!(fs::read(&rebuilt[0]).unwrap(), b"one");
+        assert_eq!(fs::read(rebuilt[1].join("two.txt")).unwrap(), b"two");
     }
 
     #[test]
