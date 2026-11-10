@@ -16,7 +16,14 @@ use crate::{filebundle, filebundle::BUNDLE_FORMAT};
 pub(crate) mod macos;
 
 #[cfg(any(target_os = "linux", test))]
+mod image_file;
+#[cfg(any(target_os = "linux", test))]
 mod linux_files;
+
+#[cfg(target_os = "linux")]
+mod x11_owner;
+#[cfg(target_os = "linux")]
+mod x11_read;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Snapshot {
@@ -55,6 +62,8 @@ pub trait ClipboardBackend: Send + Sync {
 #[derive(Clone)]
 pub struct NativeClipboard {
     context: Arc<Mutex<clipboard_rs::ClipboardContext>>,
+    #[cfg(target_os = "linux")]
+    x11_owner: Option<Arc<x11_owner::Owner>>,
     max_bytes: u64,
 }
 
@@ -74,8 +83,16 @@ impl NativeClipboard {
         use clipboard_rs::ClipboardContext;
         let context = ClipboardContext::new()
             .map_err(|error| anyhow::anyhow!("initialize native clipboard: {error}"))?;
+        #[cfg(target_os = "linux")]
+        let x11_owner = if matches!(&context, ClipboardContext::X11(_)) {
+            Some(Arc::new(x11_owner::Owner::new()?))
+        } else {
+            None
+        };
         Ok(Self {
             context: Arc::new(Mutex::new(context)),
+            #[cfg(target_os = "linux")]
+            x11_owner,
             max_bytes,
         })
     }
@@ -89,11 +106,28 @@ impl NativeClipboard {
             .context
             .lock()
             .map_err(|_| anyhow::anyhow!("clipboard lock poisoned"))?;
+        #[cfg(target_os = "macos")]
         let mut formats = context
             .available_formats()
             .map_err(|error| anyhow::anyhow!("enumerate clipboard formats: {error}"))?;
+        #[cfg(target_os = "linux")]
+        let mut formats = if self.x11_owner.is_some() {
+            x11_read::formats()?
+        } else {
+            context
+                .available_formats()
+                .map_err(|error| anyhow::anyhow!("enumerate clipboard formats: {error}"))?
+        };
         formats.sort();
         formats.dedup();
+        #[cfg(target_os = "linux")]
+        let generated_image_file = formats.iter().any(|format| format == image_file::MARKER);
+        #[cfg(target_os = "linux")]
+        if generated_image_file {
+            // These URLs are an additional local paste option, not a new file
+            // copy to send back over the mesh. Keep the snapshot image-only.
+            formats.retain(|format| !is_file_format(format) && format != "application/x-kde-cutselection");
+        }
         if formats.iter().any(|format| is_sensitive_marker(format)) {
             return Ok(None);
         }
@@ -139,7 +173,17 @@ impl NativeClipboard {
             if format.trim().is_empty() || is_internal_marker(&format) {
                 continue;
             }
-            let Ok(data) = context.get_buffer(&format) else {
+            #[cfg(target_os = "linux")]
+            let buffer = if self.x11_owner.is_some() {
+                x11_read::read(&format, self.max_bytes.saturating_sub(total))
+            } else {
+                context
+                    .get_buffer(&format)
+                    .map_err(|error| anyhow::anyhow!("{error}"))
+            };
+            #[cfg(target_os = "macos")]
+            let buffer = context.get_buffer(&format);
+            let Ok(data) = buffer else {
                 continue;
             };
             total = total
@@ -163,7 +207,11 @@ impl NativeClipboard {
             .map(|path| path.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         #[cfg(not(target_os = "macos"))]
-        let files = context.get_files().unwrap_or_default();
+        let files = if generated_image_file {
+            Vec::new()
+        } else {
+            clipboard_file_paths(&representations)
+        };
         if !files.is_empty() {
             let data = files
                 .iter()
@@ -255,8 +303,57 @@ impl NativeClipboard {
         let mut contents = Vec::with_capacity(representations.len());
         let native_files = clipboard_file_paths(representations);
         #[cfg(target_os = "linux")]
+        if native_files.is_empty()
+            && let Some(path) =
+                image_file::materialize(representations, &crate::config::paths()?.state_dir.join("images"))?
+        {
+            let mut offered = representations
+                .iter()
+                .filter(|r| {
+                    !is_internal_marker(&r.format)
+                        && !is_sensitive_marker(&r.format)
+                        && !r.format.trim().is_empty()
+                        && !is_file_format(&r.format)
+                        && r.format != "application/x-kde-cutselection"
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            offered.extend(linux_files::representations(&[path
+                .to_string_lossy()
+                .into_owned()]));
+            offered.push(Representation {
+                item: 0,
+                format: image_file::MARKER.into(),
+                data: vec![1],
+            });
+            if let Some(owner) = &self.x11_owner {
+                owner.publish(offered)?;
+            } else {
+                self.context
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("clipboard lock poisoned"))?
+                    .set(
+                        offered
+                            .into_iter()
+                            .map(|r| ClipboardContent::Other(r.format, r.data))
+                            .collect(),
+                    )
+                    .map_err(|error| anyhow::anyhow!("publish image and file clipboard: {error}"))?;
+            }
+            return self
+                .capture_sync()?
+                .context("image clipboard was empty after publishing");
+        }
+        #[cfg(target_os = "linux")]
         if !native_files.is_empty() {
-            let contents = linux_files::representations(&native_files)
+            let representations = linux_files::representations(&native_files);
+            if let Some(owner) = &self.x11_owner {
+                owner.publish(representations)?;
+                return self
+                    .capture_sync()?
+                    .context("native file clipboard was empty after publishing");
+            }
+            let contents = representations
                 .into_iter()
                 .map(|representation| ClipboardContent::Other(representation.format, representation.data))
                 .collect();
@@ -305,6 +402,23 @@ impl NativeClipboard {
         }
         if contents.is_empty() {
             bail!("clipboard payload has no safe representations");
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(owner) = &self.x11_owner {
+            owner.publish(
+                representations
+                    .iter()
+                    .filter(|r| {
+                        !r.format.trim().is_empty()
+                            && !is_internal_marker(&r.format)
+                            && !is_sensitive_marker(&r.format)
+                    })
+                    .cloned()
+                    .collect(),
+            )?;
+            return self
+                .capture_sync()?
+                .context("native clipboard was empty immediately after publishing");
         }
         let context = self
             .context
@@ -403,7 +517,10 @@ fn is_sensitive_marker(format: &str) -> bool {
 
 fn is_internal_marker(format: &str) -> bool {
     let lower = format.to_ascii_lowercase();
-    lower.contains("transienttype") || lower.contains("autogeneratedtype") || format == BUNDLE_FORMAT
+    lower.contains("transienttype")
+        || lower.contains("autogeneratedtype")
+        || format == BUNDLE_FORMAT
+        || format == "application/x-ssh-clipboard-image-file"
 }
 
 fn is_file_format(format: &str) -> bool {

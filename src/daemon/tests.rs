@@ -8,10 +8,20 @@ use crate::model::Representation;
 
 #[tokio::test]
 async fn retries_a_failed_file_capture_without_another_copy_notification() {
+    transient_capture(false).await;
+}
+
+#[tokio::test]
+async fn retries_empty_clipboard_while_provider_is_still_publishing() {
+    transient_capture(true).await;
+}
+
+async fn transient_capture(empty_first: bool) {
     use crate::clipboard::Snapshot;
     use std::sync::atomic::AtomicUsize;
 
     struct TransientClipboard {
+        empty_first: bool,
         calls: AtomicUsize,
         receiver: std::sync::Mutex<Option<mpsc::UnboundedReceiver<()>>>,
     }
@@ -20,6 +30,7 @@ async fn retries_a_failed_file_capture_without_another_copy_notification() {
         async fn capture(&self) -> Result<Option<Snapshot>> {
             match self.calls.fetch_add(1, Ordering::SeqCst) {
                 0 => Ok(None),
+                1 if self.empty_first => Ok(None),
                 1 => bail!("temporary file-provider read failure"),
                 _ => Ok(Some(Snapshot::new(vec![Representation {
                     item: 0,
@@ -40,6 +51,7 @@ async fn retries_a_failed_file_capture_without_another_copy_notification() {
     }
     let (change_tx, change_rx) = mpsc::unbounded_channel();
     let clipboard = Arc::new(TransientClipboard {
+        empty_first,
         calls: AtomicUsize::new(0),
         receiver: std::sync::Mutex::new(Some(change_rx)),
     });
