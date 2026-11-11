@@ -39,7 +39,7 @@ async function submit() {
           <path d="M44.06,0v44.08H0v105.92h105.93v-44.07h44.07V0H44.06ZM19.09,130.91c-16.47-16.47-5.29-54.45,24.96-85.18v60.2h60.23c-30.73,30.27-68.71,41.47-85.2,24.98ZM105.93,104.29v-60.21h-60.21C76.46,13.8,114.42,2.6,130.91,19.09c16.51,16.49,5.31,54.47-24.98,85.2Z" />
         </svg>
       </span>
-      <span class="text-[1.02rem] font-bold tracking-[-0.01em] text-bright">StandardAgents</span>
+      <span class="text-[1.02rem] font-bold tracking-[-0.01em] text-bright">Standard Agents</span>
       <span class="text-[0.72rem] tracking-[0.14em] text-mint">[ early access ]</span>
     </div>
     <p class="mb-5 max-w-[52rem] text-[0.92rem] leading-[1.7] text-dim">
