@@ -131,7 +131,7 @@ fn headless_x11_round_trip() {
             ssh_clipboard::filebundle::attach_bundle(&mut files, 1_000_000).unwrap();
             // Materialization uses a process-local temporary state directory.
             // The child environment below isolates this from real user data.
-            let local_files = ssh_clipboard::filebundle::materialize(uuid::Uuid::new_v4(), &files).unwrap();
+            let local_files = ssh_clipboard::filebundle::materialize(&files).unwrap();
             clipboard.apply(&local_files).await.unwrap();
             let captured = clipboard.capture().await.unwrap().unwrap();
             let uri_list = captured
@@ -199,9 +199,7 @@ fn headless_x11_round_trip() {
                         .iter()
                         .any(|r| r.format == ssh_clipboard::filebundle::BUNDLE_FORMAT)
                 );
-                let received =
-                    ssh_clipboard::filebundle::materialize(uuid::Uuid::new_v4(), &snapshot.representations)
-                        .unwrap();
+                let received = ssh_clipboard::filebundle::materialize(&snapshot.representations).unwrap();
                 let uris = received.iter().find(|r| r.format == "text/uri-list").unwrap();
                 let files = ssh_clipboard::filebundle::parse_uri_list(&uris.data);
                 assert_eq!(files.len(), paths.len());

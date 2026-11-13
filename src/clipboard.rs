@@ -170,7 +170,7 @@ impl NativeClipboard {
         let mut total = 0_u64;
         let mut representations = Vec::with_capacity(formats.len());
         for format in formats {
-            if format.trim().is_empty() || is_internal_marker(&format) {
+            if format.trim().is_empty() || is_internal_marker(&format) || is_host_local_format(&format) {
                 continue;
             }
             #[cfg(target_os = "linux")]
@@ -523,6 +523,20 @@ fn is_internal_marker(format: &str) -> bool {
         || format == "application/x-ssh-clipboard-image-file"
 }
 
+/// Formats that only mean something on this machine and change on every read.
+///
+/// GTK 4 file copies also offer the XDG document portal's transfer keys. Each
+/// read registers a fresh key, so capturing them changes the fingerprint on
+/// every poll and an unchanged file clipboard is re-broadcast as a new clip
+/// forever (and materialized again by every peer). A peer can't redeem the key
+/// anyway: the file itself travels as `text/uri-list` plus the bundle.
+fn is_host_local_format(format: &str) -> bool {
+    matches!(
+        format,
+        "application/vnd.portal.filetransfer" | "application/vnd.portal.files"
+    )
+}
+
 fn is_file_format(format: &str) -> bool {
     matches!(
         format,
@@ -777,6 +791,14 @@ mod tests {
 
         assert!(is_permission_denied(&permission));
         assert!(!is_permission_denied(&too_large));
+    }
+
+    #[test]
+    fn portal_transfer_keys_are_not_captured() {
+        assert!(is_host_local_format("application/vnd.portal.filetransfer"));
+        assert!(is_host_local_format("application/vnd.portal.files"));
+        assert!(!is_host_local_format("text/uri-list"));
+        assert!(!is_host_local_format("image/gif"));
     }
 
     #[test]
