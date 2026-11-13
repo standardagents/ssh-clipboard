@@ -488,8 +488,23 @@ impl NativeClipboard {
 }
 
 fn fingerprint(representations: &[Representation]) -> [u8; 32] {
+    // A file copy's URI list and text carry the path where a bridge staged it.
+    // Every bridge (this daemon's peers or another sync tool) stages received
+    // files under a new directory, so only the path-free bundle identifies the
+    // copy. Otherwise two bridges between the same machines echo it forever.
+    let identity = if representations
+        .iter()
+        .any(|representation| representation.format == BUNDLE_FORMAT)
+    {
+        representations
+            .iter()
+            .filter(|representation| representation.format == BUNDLE_FORMAT)
+            .collect::<Vec<_>>()
+    } else {
+        representations.iter().collect()
+    };
     let mut digest = Sha256::new();
-    for representation in representations {
+    for representation in identity {
         digest.update(representation.item.to_be_bytes());
         digest.update(
             u64::try_from(representation.format.len())
@@ -792,5 +807,42 @@ mod tests {
             data: b"same".to_vec(),
         }]);
         assert_ne!(first.fingerprint, second.fingerprint);
+    }
+
+    #[test]
+    fn file_fingerprint_ignores_where_the_files_were_staged() {
+        let staged = |uri: &str, text: Option<&str>| {
+            let mut representations = vec![
+                Representation {
+                    item: 0,
+                    format: BUNDLE_FORMAT.into(),
+                    data: b"same files".to_vec(),
+                },
+                Representation {
+                    item: 0,
+                    format: "text/uri-list".into(),
+                    data: uri.as_bytes().to_vec(),
+                },
+            ];
+            if let Some(text) = text {
+                representations.push(Representation {
+                    item: 0,
+                    format: "public.utf8-plain-text".into(),
+                    data: text.as_bytes().to_vec(),
+                });
+            }
+            Snapshot::new(representations)
+        };
+        let original = staged("file:///Users/me/Shots/shot.png", Some("~/Shots/shot.png"));
+        let restaged = staged(
+            "file:///Users/me/.local/share/other-bridge/files/1/shot.png",
+            None,
+        );
+        assert_eq!(original.fingerprint, restaged.fingerprint);
+
+        let mut different = staged("file:///Users/me/Shots/shot.png", None);
+        different.representations[0].data = b"other files".to_vec();
+        let different = Snapshot::new(different.representations);
+        assert_ne!(original.fingerprint, different.fingerprint);
     }
 }

@@ -70,6 +70,88 @@ async fn transient_capture(empty_first: bool) {
     watcher.await.unwrap();
 }
 
+#[tokio::test]
+async fn does_not_resend_files_another_bridge_restaged() {
+    use crate::clipboard::Snapshot;
+    use crate::filebundle::BUNDLE_FORMAT;
+
+    struct SequenceClipboard {
+        captures: std::sync::Mutex<std::collections::VecDeque<Snapshot>>,
+        receiver: std::sync::Mutex<Option<mpsc::UnboundedReceiver<()>>>,
+    }
+    #[async_trait::async_trait]
+    impl ClipboardBackend for SequenceClipboard {
+        async fn capture(&self) -> Result<Option<Snapshot>> {
+            Ok(self.captures.lock().unwrap().pop_front())
+        }
+        async fn apply(&self, _: &[Representation]) -> Result<Snapshot> {
+            unreachable!()
+        }
+        fn name(&self) -> &'static str {
+            "sequence-test"
+        }
+        fn change_receiver(&self, _: Duration) -> Option<mpsc::UnboundedReceiver<()>> {
+            self.receiver.lock().unwrap().take()
+        }
+    }
+    let files = |uri: &str| {
+        Snapshot::new(vec![
+            Representation {
+                item: 0,
+                format: BUNDLE_FORMAT.into(),
+                data: b"screenshot bundle".to_vec(),
+            },
+            Representation {
+                item: 0,
+                format: "text/uri-list".into(),
+                data: uri.as_bytes().to_vec(),
+            },
+        ])
+    };
+    let text = Snapshot::new(vec![Representation {
+        item: 0,
+        format: "text/plain".into(),
+        data: b"next copy".to_vec(),
+    }]);
+    let (change_tx, change_rx) = mpsc::unbounded_channel();
+    let clipboard = Arc::new(SequenceClipboard {
+        captures: std::sync::Mutex::new(
+            [
+                Snapshot::new(vec![Representation {
+                    item: 0,
+                    format: "text/plain".into(),
+                    data: b"clipboard at startup".to_vec(),
+                }]),
+                files("file:///Users/me/Shots/shot.png"),
+                files("file:///Users/me/.local/share/other-bridge/files/1/shot.png"),
+                files("file:///Users/me/.local/share/other-bridge/files/2/shot.png"),
+                text,
+            ]
+            .into(),
+        ),
+        receiver: std::sync::Mutex::new(Some(change_rx)),
+    });
+    let daemon = Daemon::new(Config::default(), clipboard);
+    let mut events = daemon.events.subscribe();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let watcher = tokio::spawn(daemon.watch_clipboard(shutdown_rx));
+    let mut sent = Vec::new();
+    for _ in 0..4 {
+        change_tx.send(()).unwrap();
+    }
+    while sent.len() < 2 {
+        let event = timeout(Duration::from_secs(2), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.direction, Direction::Local);
+        sent.push(event.preview);
+    }
+    assert_eq!(sent[1], "next copy");
+    shutdown_tx.send(true).unwrap();
+    watcher.await.unwrap();
+}
+
 #[test]
 fn status_from_an_older_daemon_defaults_version_fields() {
     let status: Status = serde_json::from_value(serde_json::json!({
