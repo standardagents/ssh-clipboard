@@ -146,11 +146,26 @@ impl Daemon {
         let mut changes = self.clipboard.change_receiver(poll);
         let mut interval = tokio::time::interval(Duration::from_millis(self.config.poll_interval_ms));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Without a change notification (Wayland) every poll reads and hashes
+        // every format. A large clipboard, such as a macOS screenshot with its
+        // PNG and TIFF aliases, would be read back to back, so the next poll
+        // waits in proportion to what the last capture cost.
+        let mut not_before: Option<tokio::time::Instant> = None;
         loop {
             tokio::select! {
-                () = retry.next(&mut changes, &mut interval) => {
+                () = async {
+                    // Kept until the next capture, so that a cancelled wait
+                    // (another branch ran first) resumes instead of ending.
+                    if let Some(at) = not_before {
+                        tokio::time::sleep_until(at).await;
+                    }
+                    retry.next(&mut changes, &mut interval).await;
+                } => {
                     let _guard = self.apply_lock.lock().await;
-                    let snapshot = match self.clipboard.capture().await {
+                    let started = std::time::Instant::now();
+                    let captured = self.clipboard.capture().await;
+                    not_before = capture_pause(started.elapsed(), poll);
+                    let snapshot = match captured {
                         Ok(Some(snapshot)) => { retry.reset(); snapshot },
                         // Clipboard ownership/change notification may precede
                         // the provider publishing its image or file data. An
@@ -497,6 +512,13 @@ impl Daemon {
             version_unknown_peers,
         }
     }
+}
+
+/// When the next poll may start after a capture that took `cost`: at once
+/// after a cheap one, otherwise after nine times its cost (three seconds at
+/// most), so that polling a large clipboard takes about a tenth of the time.
+fn capture_pause(cost: Duration, poll: Duration) -> Option<tokio::time::Instant> {
+    (cost > poll / 2).then(|| tokio::time::Instant::now() + (cost * 9).min(Duration::from_secs(3)))
 }
 
 async fn next_clipboard_change(

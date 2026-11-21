@@ -521,3 +521,62 @@ fn refuses_to_delete_a_non_socket_path() {
     assert!(remove_stale_socket(&path).is_err());
     assert_eq!(std::fs::read(path).unwrap(), b"important");
 }
+
+#[tokio::test]
+async fn polling_waits_after_an_expensive_capture() {
+    let calls = polled_captures(Duration::from_millis(60), Duration::from_millis(1500)).await;
+    // One capture and nine times its cost per cycle: about three captures,
+    // where back-to-back polling makes about twenty.
+    assert!((2..=5).contains(&calls), "captures: {calls}");
+}
+
+#[tokio::test]
+async fn polling_keeps_its_interval_after_a_cheap_capture() {
+    let calls = polled_captures(Duration::ZERO, Duration::from_millis(500)).await;
+    assert!(calls >= 10, "captures: {calls}");
+}
+
+/// Captures made in `window` by a backend without change notifications whose
+/// captures take `cost`, polled every 20 ms.
+async fn polled_captures(cost: Duration, window: Duration) -> usize {
+    use crate::clipboard::Snapshot;
+    use std::sync::atomic::AtomicUsize;
+
+    struct PolledClipboard {
+        cost: Duration,
+        calls: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl ClipboardBackend for PolledClipboard {
+        async fn capture(&self) -> Result<Option<Snapshot>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.cost).await;
+            Ok(Some(Snapshot::new(vec![Representation {
+                item: 0,
+                format: "image/png".into(),
+                data: b"unchanged".to_vec(),
+            }])))
+        }
+        async fn apply(&self, _: &[Representation]) -> Result<Snapshot> {
+            unreachable!()
+        }
+        fn name(&self) -> &'static str {
+            "polled-test"
+        }
+    }
+    let clipboard = Arc::new(PolledClipboard {
+        cost,
+        calls: AtomicUsize::new(0),
+    });
+    let config = Config {
+        poll_interval_ms: 20,
+        ..Config::default()
+    };
+    let daemon = Daemon::new(config, Arc::clone(&clipboard) as Arc<dyn ClipboardBackend>);
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let watcher = tokio::spawn(daemon.watch_clipboard(shutdown_rx));
+    tokio::time::sleep(window).await;
+    shutdown_tx.send(true).unwrap();
+    watcher.await.unwrap();
+    clipboard.calls.load(Ordering::SeqCst)
+}
