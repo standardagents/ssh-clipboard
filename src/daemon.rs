@@ -360,7 +360,7 @@ impl Daemon {
         let _guard = self.apply_lock.lock().await;
         #[cfg(target_os = "macos")]
         let received_file = file_conflict::has_file_bundle(&clip.representations);
-        let representations = match filebundle::materialize(clip.id, &clip.representations) {
+        let representations = match filebundle::materialize(&clip.representations) {
             Ok(representations) => representations,
             Err(error) => {
                 warn!(%error, peer = %peer_name, clip = %clip.id, "failed to materialize copied files");
